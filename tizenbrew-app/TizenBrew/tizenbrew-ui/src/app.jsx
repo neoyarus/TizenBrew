@@ -44,7 +44,7 @@ export default function App() {
     <ErrorBoundary>
       <LocationProvider>
         {context.state.sharedData.startupPending ? (
-          <div className="startup-screen" role="status" aria-busy="true">TizenBrew</div>
+          <div className="startup-screen" role="status" aria-busy="true" aria-label="YouTube" />
         ) : (<div className="flex flex-col h-screen">
         <div className="shrink-0"><Header /></div>
         <div className="bg-slate-800 text-white overflow-hidden flex-1 min-h-0">
