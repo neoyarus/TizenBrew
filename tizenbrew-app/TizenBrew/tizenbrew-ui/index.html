@@ -5,10 +5,14 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>TizenBrew</title>
+    <style>
+      html, body { margin: 0; background: #0f172a; }
+      .startup-screen { height: 100vh; display: flex; align-items: center; justify-content: center; color: #cbd5e1; font: 32px sans-serif; background: #0f172a; }
+    </style>
     <script type="text/javascript" src="$WEBAPIS/webapis/webapis.js"></script>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app"><div class="startup-screen" role="status" aria-busy="true">TizenBrew</div></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

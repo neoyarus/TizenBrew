@@ -9,6 +9,7 @@ const initialState = {
             tizenDebug: false
         },
         modules: null,
+        startupPending: true,
         state: null,
         error: {
             message: null,
@@ -31,8 +32,11 @@ function reducer(state, action) {
             return { ...state, sharedData: { ...state.sharedData, debugStatus: action.payload } };
         case 'SET_STATE':
             return { ...state, sharedData: { ...state.sharedData, state: action.payload } };
+        case 'SET_STARTUP_PENDING':
+            return { ...state, sharedData: { ...state.sharedData, startupPending: action.payload } };
         case 'SET_ERROR':
-            return { ...state, sharedData: { ...state.sharedData, error: action.payload } };
+            return { ...state, sharedData: { ...state.sharedData, error: action.payload,
+                startupPending: action.payload.message ? false : state.sharedData.startupPending } };
         default:
             return state;
     }

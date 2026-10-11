@@ -16,14 +16,25 @@ const Events = {
 class Client {
     constructor(context, socket = new WebSocket('ws://localhost:8081')) {
         this.context = context;
+        this.debugStatus = context.state.sharedData.debugStatus;
         this.socket = socket;
         this.pendingEvents = [];
         this.modulesLoaded = false;
         this.modules = [];
         this.startupLaunchHandled = false;
+        this.pendingNavigation = null;
+        // Leave a usable menu and error if startup or document-start injection stalls.
+        this.startupTimer = setTimeout(() => {
+            if (window.shouldDisableAutoLaunch && !this.startupLaunchHandled) {
+                this.showMenu();
+            } else {
+                this.failStartup('errors.serviceDidntConnectYet');
+            }
+        }, 20000);
         this.socket.onopen = this.onOpen.bind(this);
         this.socket.onmessage = this.onMessage.bind(this);
-        this.socket.onerror = () => location.reload();
+        this.socket.onerror = () => this.failStartup('errors.serviceDidntConnectYet');
+        this.socket.onclose = () => this.failStartup('errors.serviceDidntConnectYet');
 
         // startService may hand over a socket whose open event already fired.
         if (this.socket.readyState === WebSocket.OPEN) this.onOpen();
@@ -77,11 +88,10 @@ class Client {
             }
 
             case Events.GetDebugStatus: {
-                const state = this.context.state;
-                state.sharedData.debugStatus = payload;
+                this.debugStatus = payload;
                 this.context.dispatch({
-                    type: 'SET_SHARED_DATA',
-                    payload: state.sharedData
+                    type: 'SET_DEBUG_STATUS',
+                    payload
                 });
 
                 if (!payload.rwiDebug && !payload.appDebug && !payload.tizenDebug) {
@@ -114,13 +124,7 @@ class Client {
                     });
                 }
                 else {
-                    this.context.dispatch({
-                        type: 'SET_ERROR',
-                        payload: {
-                            message: 'errors.debuggingNotEnabled',
-                            disappear: false
-                        }
-                    });
+                    this.failStartup('errors.debuggingNotEnabled');
                 }
 
                 break;
@@ -164,24 +168,26 @@ class Client {
             }
 
             case Events.LaunchModule: {
-                const module = this.modules.find(mdl => mdl.fullName === payload);
-
-                if (module) {
-                    for (const key of module.keys) {
-                        tizen.tvinputdevice.registerKey(key);
-                    }
-
-                    location.href = module.appPath;
+                const pending = this.pendingNavigation;
+                if (pending && pending.module.fullName === payload) {
+                    this.pendingNavigation = null;
+                    clearTimeout(this.startupTimer);
+                    location.href = pending.module.appPath;
                 }
 
+                break;
+            }
+
+            case Events.Error: {
+                this.failStartup(payload);
                 break;
             }
         }
     }
 
     handleCanLaunchModules(payload) {
-        const debugStatus = this.context.state.sharedData.debugStatus;
-        debugStatus.webDebug = true;
+        const debugStatus = { ...this.debugStatus, webDebug: true };
+        this.debugStatus = debugStatus;
         this.context.dispatch({
             type: 'SET_DEBUG_STATUS',
             payload: debugStatus
@@ -191,6 +197,7 @@ class Client {
             if (payload.type === 'autolaunch' && !window.shouldDisableAutoLaunch) {
                 const module = this.modules.find(mdl => mdl.fullName === payload.module);
                 if (!module) {
+                    this.showMenu();
                     this.context.dispatch({
                         type: 'SET_ERROR',
                         payload: {
@@ -204,18 +211,7 @@ class Client {
                     return;
                 }
                 this.startupLaunchHandled = true;
-                for (const key of module.keys) {
-                    tizen.tvinputdevice.registerKey(key);
-                }
-
-                this.send({
-                    type: Events.LaunchModule,
-                    payload: module
-                });
-
-                if (!module.evaluateScriptOnDocumentStart) {
-                    location.href = module.appPath;
-                }
+                this.launchModule(module, true);
             }
             else if (payload.type === 'appControl') {
                 const module = payload.module;
@@ -230,8 +226,41 @@ class Client {
                 });
 
                 module.appPath.includes('?') ? location.href = `${module.appPath}&${payload.args}` : location.href = `${module.appPath}?${payload.args}`;
+                clearTimeout(this.startupTimer);
             }
+            else {
+                this.showMenu();
+            }
+        } else if (!payload) {
+            this.showMenu();
         }
+    }
+
+    showMenu() {
+        clearTimeout(this.startupTimer);
+        this.context.dispatch({ type: 'SET_STARTUP_PENDING', payload: false });
+    }
+
+    launchModule(module, startup = false) {
+        for (const key of module.keys) tizen.tvinputdevice.registerKey(key);
+        this.pendingNavigation = module.evaluateScriptOnDocumentStart ? { module, startup } : null;
+        this.send({ type: Events.LaunchModule, payload: module });
+        if (!module.evaluateScriptOnDocumentStart) {
+            clearTimeout(this.startupTimer);
+            location.href = module.appPath;
+        }
+    }
+
+    cancelAutoLaunch() {
+        if (this.pendingNavigation && this.pendingNavigation.startup) this.pendingNavigation = null;
+        this.showMenu();
+    }
+
+    failStartup(message) {
+        this.startupLaunchHandled = true;
+        if (this.pendingNavigation && this.pendingNavigation.startup) this.pendingNavigation = null;
+        this.showMenu();
+        this.context.dispatch({ type: 'SET_ERROR', payload: { message, disappear: false } });
     }
 
     processPendingEvents() {

@@ -157,11 +157,16 @@ function uiHarness(appControlData = []) {
     const sockets = [];
     const dispatches = [];
     const keys = [];
+    const serviceLaunches = [];
+    let reloads = 0;
+    const stateSource = source(path.join(appRoot, 'tizenbrew-ui/src/components/ClientContext.jsx'));
+    const stateCode = stateSource.slice(stateSource.indexOf('const initialState'), stateSource.indexOf('export const GlobalStateContext'));
+    const stateModule = vm.runInNewContext(stateCode + '\n({ initialState, reducer })');
     const context = {
-        state: { sharedData: { debugStatus: {} } },
-        dispatch(action) { dispatches.push(action); }
+        state: stateModule.initialState,
+        dispatch(action) { dispatches.push(action); context.state = stateModule.reducer(context.state, action); }
     };
-    const location = { href: '/menu.html', reload() {} };
+    const location = { href: '/menu.html', reload() { reloads++; } };
     class WebSocket {
         static OPEN = 1;
         constructor() { this.readyState = 0; this.sent = []; sockets.push(this); }
@@ -175,7 +180,9 @@ function uiHarness(appControlData = []) {
         window: { location, shouldDisableAutoLaunch: false },
         setTimeout: timer.setTimeout, clearTimeout: timer.clearTimeout,
         tizen: {
+            ApplicationControl: function (operation) { this.operation = operation; },
             application: {
+                launchAppControl(control, id, success, failure) { serviceLaunches.push({ control, id, success, failure }); },
                 getCurrentApplication: () => ({
                     appInfo: { packageId: 'test' },
                     getRequestedAppControl: () => ({ appControl: { data: appControlData } }), exit() {}
@@ -191,6 +198,7 @@ function uiHarness(appControlData = []) {
     const { Client, Events } = sandbox.module.exports;
     return {
         timer, sockets, dispatches, keys, context, location, window: sandbox.window, Client, Events,
+        serviceLaunches, get reloads() { return reloads; },
         create(existingSocket) { return new Client(context, existingSocket); },
         startService() {
             // This standalone function has no JSX; execute its actual source with the real Client.

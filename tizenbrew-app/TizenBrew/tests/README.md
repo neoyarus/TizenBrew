@@ -10,6 +10,8 @@ Alternatively run `npm test` inside `service-nextgen/service` or `tizenbrew-ui` 
 
 The VM harness executes the actual production CommonJS service modules and the UI Client. It replaces the unavailable TV, ADB, debugger, websocket, and network interfaces with deterministic mocks. Timers advance explicitly, so retries and connection replacement require no real-time sleep. Tests and test tooling stay outside the service build tree and do not change the TV's runtime requirements.
 
+The startup UI coverage also checks that modules arriving before the launch decision do not reveal the menu, manual startup and UP reveal it, delayed debugger replies preserve that decision, and late document-start acknowledgments cannot navigate after UP or a timeout. Service startup reconnects without a document reload and stops with a visible error if its bounded retries fail.
+
 To reproduce the failures on a prior Git revision without changing the working tree, set `TIZENBREW_TEST_REF`. For example, from the repository root:
 
 ```powershell
