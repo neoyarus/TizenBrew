@@ -1,0 +1,10 @@
+{
+  "serviceFile": "service.js",
+  "appPath": "index.html",
+  "packageType": "app",
+  "private": true,
+  "appName": "Temporary TizenBrew signed update",
+  "name": "tizenbrew-once-deploy-helper",
+  "version": "1.0.0",
+  "keys": []
+}
