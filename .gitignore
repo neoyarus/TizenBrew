@@ -3,6 +3,7 @@ node_modules
 .sign
 .metadata
 dist
+transpiled
 .buildResult
 .vs
 bin

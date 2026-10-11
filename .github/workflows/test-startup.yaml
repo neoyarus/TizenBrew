@@ -19,4 +19,4 @@ jobs:
         with:
           node-version: 22
       - name: Test service and frontend startup
-        run: node --test tizenbrew-app/TizenBrew/tests/autolaunch-service.test.cjs tizenbrew-app/TizenBrew/tests/autolaunch-ui.test.cjs
+        run: node --test tizenbrew-app/TizenBrew/tests/autolaunch-service.test.cjs tizenbrew-app/TizenBrew/tests/autolaunch-ui.test.cjs tizenbrew-app/TizenBrew/tests/direct-launch-lifecycle.test.cjs tizenbrew-app/TizenBrew/tests/remote-launch-service.test.cjs

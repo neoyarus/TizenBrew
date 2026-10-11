@@ -12,10 +12,11 @@ function getReadyClient(services) {
     return client;
 }
 
-function sendClientInformation(services, data) {
+function sendClientInformation(services, data, isCurrent) {
+    if (isCurrent && !isCurrent()) return;
     const client = getReadyClient(services);
     if (!client) {
-        return setTimeout(() => sendClientInformation(services, data), 50);
+        return setTimeout(() => sendClientInformation(services, data, isCurrent), 50);
     }
     client.send(data);
 }

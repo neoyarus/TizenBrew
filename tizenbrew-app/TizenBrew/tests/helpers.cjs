@@ -60,6 +60,7 @@ function socket(readyState = 1) {
 function serviceHarness(options = {}) {
     const timer = clock();
     const config = { modules: [], autoLaunchServiceList: [], autoLaunchModule: 'npm/example' };
+    if (options.remoteLauncher) config.remoteLauncher = { enabled: true, token: 'a'.repeat(64) };
     const example = {
         name: 'example', fullName: 'npm/example', keys: ['MediaPlay'], appPath: '/example.html',
         packageType: 'module', mainFile: 'main.js', evaluateScriptOnDocumentStart: false
@@ -67,6 +68,11 @@ function serviceHarness(options = {}) {
     const cdpClients = [];
     const scriptRequests = [];
     const adbClients = [];
+    const adbControl = { fail: false };
+    const fetchRequests = [];
+    const resumeRequests = [];
+    let remoteHandler;
+    let remoteServer;
     let server;
     const cache = new Map();
     const mockWebSocket = { OPEN: 1, Server: class extends EventEmitter {
@@ -84,9 +90,14 @@ function serviceHarness(options = {}) {
         'ws': mockWebSocket, 'ws-old': mockWebSocket, 'ws-new': mockWebSocket,
         'chrome-remote-interface': (cdpOptions, callback) => {
             const client = new EventEmitter();
+            client.options = cdpOptions;
             client.Runtime = { enable() {}, evaluate() {} };
             client.Debugger = { enable() {} };
-            client.Page = { addScriptToEvaluateOnNewDocument(request) {
+            client.close = () => { client.closed = true; client.emit('disconnect'); return Promise.resolve(); };
+            client.Page = { getNavigationHistory() {
+                if (client.history) return client.history();
+                return Promise.resolve({ currentIndex: 0, entries: [{ url: options.historyUrl || example.appPath }] });
+            }, addScriptToEvaluateOnNewDocument(request) {
                 const pending = { request };
                 scriptRequests.push(pending);
                 if (options.deferScripts) return new Promise(resolve => { pending.resolve = resolve; });
@@ -96,16 +107,35 @@ function serviceHarness(options = {}) {
             callback(client);
             return client;
         },
-        'node-fetch': () => Promise.resolve({
-            json: () => Promise.resolve({ device: { developerIP: '127.0.0.1', developerMode: '1' } }),
-            text: () => Promise.resolve('module source')
-        }),
+        'node-fetch': (url, requestOptions) => {
+            fetchRequests.push({ url, options: requestOptions });
+            if (requestOptions && requestOptions.method === 'POST') {
+                const pending = { url, options: requestOptions };
+                resumeRequests.push(pending);
+                if (options.deferResume) return new Promise((resolve, reject) => { pending.resolve = resolve; pending.reject = reject; });
+                if (options.failResume) return Promise.reject(new Error('Resume failed'));
+                return Promise.resolve({ ok: options.resumeOk !== false });
+            }
+            return Promise.resolve({
+                json: () => Promise.resolve({ device: { developerIP: '127.0.0.1', developerMode: '1' } }),
+                text: () => Promise.resolve('module source')
+            });
+        },
+        http: { createServer(handler) {
+            remoteHandler = handler;
+            remoteServer = new EventEmitter();
+            remoteServer.listen = (port, host) => { remoteServer.address = { port, host }; };
+            remoteServer.close = () => { remoteServer.closed = true; };
+            remoteServer.setTimeout = () => {};
+            return remoteServer;
+        } },
         express: () => ({ all() {}, listen() { return {}; } }),
         adbhost: { createConnection() {
+            if (adbControl.fail) throw new Error('ADB unavailable');
             const stream = new EventEmitter();
             stream.end = () => {};
             const shell = new EventEmitter();
-            const client = { _stream: stream, shell, createStream: () => shell };
+            const client = { _stream: stream, shell, commands: [], createStream(command) { client.commands.push(command); return client.shell; } };
             adbClients.push(client);
             return client;
         } }
@@ -130,7 +160,25 @@ function serviceHarness(options = {}) {
     const { Connection, Events } = load(path.join(serviceRoot, 'utils/wsCommunication.js'));
     const startDebugging = load(path.join(serviceRoot, 'utils/debugger.js'));
     return {
-        timer, config, example, Events, Connection, cdpClients, scriptRequests,
+        timer, config, example, Events, Connection, cdpClients, scriptRequests, adbClients, adbControl, fetchRequests, resumeRequests,
+        get remoteServer() { return remoteServer; },
+        requestRemote({ method = 'GET', path: route = '/status', headers = {} } = {}) {
+            if (!remoteHandler) throw new Error('Remote launcher is not enabled');
+            const request = new EventEmitter();
+            request.method = method;
+            request.url = route;
+            request.headers = { authorization: 'Bearer ' + config.remoteLauncher.token, 'content-length': '0', ...headers };
+            request.setTimeout = () => {};
+            request.destroy = () => { request.destroyed = true; };
+            let complete;
+            const response = { done: new Promise(resolve => { complete = resolve; }),
+                writeHead(status) { response.status = status; },
+                end(body) { response.body = JSON.parse(body); response.writableEnded = true; complete(response); }
+            };
+            remoteHandler(request, response);
+            request.emit('end');
+            return response;
+        },
         start() { load(path.join(serviceRoot, 'index.js')).onStart(); },
         connect() { const ws = socket(); server.emit('connection', ws); return ws; },
         debug(ws) {
@@ -138,7 +186,7 @@ function serviceHarness(options = {}) {
             timer.advance(1000);
             const adb = adbClients.at(-1);
             adb._stream.emit('connect');
-            adb.shell.emit('data', Buffer.from('debug: 9222'));
+            adb.shell.emit('data', Buffer.from('debug: 9222\n'));
         },
         attach(services, appControl = { module: null, args: null }, mdl = { name: '' }) {
             const state = { tizenDebug: false, webDebug: false, rwiDebug: false };
