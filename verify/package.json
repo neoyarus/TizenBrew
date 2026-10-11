@@ -1,0 +1,10 @@
+{
+  "version": "1.0.0",
+  "private": true,
+  "appName": "Temporary TizenBrew reboot verification",
+  "keys": [],
+  "serviceFile": "service.js",
+  "packageType": "app",
+  "appPath": "index.html",
+  "name": "tizenbrew-temporary-reboot-verifier"
+}
