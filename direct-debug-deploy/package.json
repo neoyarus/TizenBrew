@@ -1,5 +1,9 @@
 {
   "name": "tizenbrew-direct-debug-deployment",
   "version": "1.0.0",
+  "packageType": "app",
+  "appName": "TizenBrew recovery",
+  "description": "Signed recovery installer",
+  "appPath": "index.html",
   "serviceFile": "service.js"
 }
