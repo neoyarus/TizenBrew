@@ -1,0 +1,5 @@
+{
+  "name": "tizenbrew-launcher-provision",
+  "version": "1.0.0",
+  "serviceFile": "service.js"
+}
