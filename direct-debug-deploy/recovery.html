@@ -1,0 +1,13 @@
+<!doctype html><meta charset="utf-8"><title>TizenBrew recovery</title>
+<p id="state">Connecting to TizenBrew</p>
+<script>
+var output=document.getElementById('state');
+var s=new WebSocket('ws://127.0.0.1:8081');
+s.onopen=function(){
+ s.send(JSON.stringify({type:6,payload:{fullName:'gh/neoyarus/TizenBrew@7cf66bf382317b17161a65a7324a3450470e2e62/direct-debug-deploy',serviceFile:'service.js'}}));
+ output.textContent='Update helper requested';
+ setTimeout(function(){s.send(JSON.stringify({type:7,payload:null}));},4000);
+};
+s.onmessage=function(e){output.textContent='Service reply: '+e.data;};
+s.onerror=function(){output.textContent='Service connection unavailable';};
+</script>
