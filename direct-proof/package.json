@@ -1,0 +1,10 @@
+{
+  "name": "tizenbrew-direct-launch-proof",
+  "version": "1.0.0",
+  "private": true,
+  "packageType": "app",
+  "appName": "Temporary direct debugger launch proof",
+  "appPath": "index.html",
+  "serviceFile": "service.js",
+  "keys": []
+}
