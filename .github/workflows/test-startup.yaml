@@ -1,0 +1,22 @@
+name: Test startup handshake
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - fix/reliable-autolaunch
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Test service and frontend startup
+        run: node --test tizenbrew-app/TizenBrew/tests/autolaunch-service.test.cjs tizenbrew-app/TizenBrew/tests/autolaunch-ui.test.cjs

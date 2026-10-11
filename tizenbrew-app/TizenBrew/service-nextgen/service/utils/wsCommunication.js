@@ -2,6 +2,7 @@ class Connection {
     constructor(connection) {
         this.connection = connection;
         this.isReady = false;
+        this.launchInformationSent = false;
     }
 
     send(data) {

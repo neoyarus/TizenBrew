@@ -20,9 +20,9 @@ import ArabicLanguage from '../lang/ar-sa.json';
 import CatalanLanguage from '../lang/cat.json';
 import LithuanianLanguage from '../lang/lt.json';
 import BosnianLanguage from '../lang/bs_BA.json';
-import CroatianLanguage from '../land/hr_HR.json';
+import CroatianLanguage from '../lang/hr_HR.json';
 import SerbianCyrillicLanguage from '../lang/sr_SP.json';
-import SerbianLatinLanguage from '../lang/sr_RS.json';
+import SerbianLatinLanguage from '../lang/sr_SR.json';
 import KlingonLanguage from '../lang/tlh_KL.json';
 import CzechLanguage from '../lang/cs.json';
 

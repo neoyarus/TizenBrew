@@ -14,15 +14,19 @@ const Events = {
 };
 
 class Client {
-    constructor(context) {
+    constructor(context, socket = new WebSocket('ws://localhost:8081')) {
         this.context = context;
-        this.socket = new WebSocket('ws://localhost:8081');
-        this.socket.onopen = this.onOpen.bind(this);
-        this.socket.onmessage = this.onMessage.bind(this);
-        this.socket.onerror = () => location.reload();
+        this.socket = socket;
         this.pendingEvents = [];
         this.modulesLoaded = false;
         this.modules = [];
+        this.startupLaunchHandled = false;
+        this.socket.onopen = this.onOpen.bind(this);
+        this.socket.onmessage = this.onMessage.bind(this);
+        this.socket.onerror = () => location.reload();
+
+        // startService may hand over a socket whose open event already fired.
+        if (this.socket.readyState === WebSocket.OPEN) this.onOpen();
     }
 
     onOpen() {
@@ -183,7 +187,7 @@ class Client {
             payload: debugStatus
         });
 
-        if (payload) {
+        if (payload && !this.startupLaunchHandled) {
             if (payload.type === 'autolaunch' && !window.shouldDisableAutoLaunch) {
                 const module = this.modules.find(mdl => mdl.fullName === payload.module);
                 if (!module) {
@@ -199,6 +203,7 @@ class Client {
                     });
                     return;
                 }
+                this.startupLaunchHandled = true;
                 for (const key of module.keys) {
                     tizen.tvinputdevice.registerKey(key);
                 }
@@ -214,6 +219,7 @@ class Client {
             }
             else if (payload.type === 'appControl') {
                 const module = payload.module;
+                this.startupLaunchHandled = true;
                 for (const key of module.keys) {
                     tizen.tvinputdevice.registerKey(key);
                 }

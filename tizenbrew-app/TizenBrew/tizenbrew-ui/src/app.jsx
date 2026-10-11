@@ -108,7 +108,7 @@ function startService(context) {
 
     context.dispatch({
       type: 'SET_CLIENT',
-      payload: new Client(context)
+      payload: new Client(context, testWS)
     });
 
   }

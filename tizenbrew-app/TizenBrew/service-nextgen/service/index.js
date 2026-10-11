@@ -11,6 +11,7 @@ module.exports.onStart = function () {
     const startDebugging = require('./utils/debugger.js');
     const startService = require('./utils/serviceLauncher.js');
     const { Connection, Events } = require('./utils/wsCommunication.js');
+    const { sendLaunchInformation } = require('./utils/clientInformation.js');
     let WebSocket;
     if (process.version === 'v4.4.3') {
         WebSocket = require('ws-old');
@@ -123,11 +124,10 @@ module.exports.onStart = function () {
 
     wsServer.on('connection', (ws) => {
         const wsConn = new Connection(ws);
-        for (const event of queuedEvents) {
-            wsConn.send(event);
-            queuedEvents.splice(queuedEvents.indexOf(event), 1);
-        }
-        services.set('wsConn', wsConn);
+        ws.on('close', () => {
+            wsConn.isReady = false;
+            if (services.get('wsConn') === wsConn) services.delete('wsConn');
+        });
         ws.on('message', (message) => {
             let msg;
             try {
@@ -175,9 +175,6 @@ module.exports.onStart = function () {
                     break;
                 }
                 case Events.GetModules: {
-                    wsConn.isReady = true;
-                    services.set('wsConn', wsConn);
-
                     if (payload) {
                         loadModules().then(modules => {
                             modulesCache = modules;
@@ -273,6 +270,10 @@ module.exports.onStart = function () {
                 case Events.Ready: {
                     wsConn.isReady = true;
                     services.set('wsConn', wsConn);
+                    while (queuedEvents.length > 0) {
+                        wsConn.send(queuedEvents.shift());
+                    }
+                    sendLaunchInformation(services, inDebug, appControlData);
                     break;
                 }
                 default: {

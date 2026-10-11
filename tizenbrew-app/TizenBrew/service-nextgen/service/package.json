@@ -4,6 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "test": "node --test ../../tests/autolaunch-service.test.cjs",
     "build": "babel . --out-dir transpiled --copy-files && npx @vercel/ncc build transpiled/index.js -o ./dist"
   },
   "keywords": [],
