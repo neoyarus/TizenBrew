@@ -1,5 +1,5 @@
 {
-  "presets": ["@babel/preset-env"],
+  "presets": [["@babel/preset-env", { "targets": { "node": "4.4.3" }, "forceAllTransforms": true }]],
   "ignore": [
     "node_modules/@babel/",
     "node_modules/adbhost/",

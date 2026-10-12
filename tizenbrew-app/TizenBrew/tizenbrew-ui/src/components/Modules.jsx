@@ -1,7 +1,6 @@
 import { useFocusable } from '@noriginmedia/norigin-spatial-navigation'
 import { useEffect, useContext } from 'react';
 import { GlobalStateContext } from './ClientContext.jsx';
-import { Events } from './WebSocketClient.js';
 
 function classNames(...classes) {
   return classes.filter(Boolean).join(' ')
@@ -20,18 +19,7 @@ function Item({ children, module, id, state }) {
   }, [focused, ref]);
 
   function handleOnClick() {
-    for (const key of module.keys) {
-      tizen.tvinputdevice.registerKey(key);
-    }
-
-    state.client.send({
-      type: Events.LaunchModule,
-      payload: module
-    });
-
-    if (!module.evaluateScriptOnDocumentStart) {
-      location.href = module.appPath;
-    }
+    state.client.launchModule(module);
   }
 
   return (

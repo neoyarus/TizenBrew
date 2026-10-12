@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>TizenBrew Recovery</title>
+    <style>
+        html, body { margin: 0; width: 100%; height: 100%; background: #17212b; color: #edf4f7; font-family: sans-serif; }
+        main { box-sizing: border-box; padding: 15vh 12vw; }
+        h1 { font-size: 5vh; font-weight: 600; }
+        p { max-width: 70vw; font-size: 3vh; line-height: 1.5; }
+        button { margin-top: 3vh; padding: 1.5vh 3vw; border: 0; border-radius: 0.5vh; background: #edf4f7; color: #17212b; font-size: 2.8vh; }
+        button:focus { outline: 0.5vh solid #4ec9b0; outline-offset: 0.5vh; }
+    </style>
+</head>
+<body>
+    <main>
+        <h1>TizenBrew Recovery</h1>
+        <p id="status" role="status">Starting the recovery service…</p>
+        <p id="details">This app starts the independent recovery service. Your computer verifies that it is ready.</p>
+        <button id="return" type="button">Return to TV</button>
+    </main>
+    <script src="bootstrap.js"></script>
+</body>
+</html>

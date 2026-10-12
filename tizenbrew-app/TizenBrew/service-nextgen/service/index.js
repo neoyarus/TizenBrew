@@ -6,11 +6,14 @@ module.exports.onStart = function () {
     const express = require('express');
     const fetch = require('node-fetch');
     const path = require('path');
+    const url = require('url');
     const { readConfig, writeConfig } = require('./utils/configuration.js');
     const loadModules = require('./utils/moduleLoader.js');
     const startDebugging = require('./utils/debugger.js');
     const startService = require('./utils/serviceLauncher.js');
     const { Connection, Events } = require('./utils/wsCommunication.js');
+    const { sendLaunchInformation } = require('./utils/clientInformation.js');
+    const { startRemoteLauncher } = require('./utils/remoteLauncher.js');
     let WebSocket;
     if (process.version === 'v4.4.3') {
         WebSocket = require('ws-old');
@@ -45,6 +48,14 @@ module.exports.onStart = function () {
     const wsServer = new WebSocket.Server({ server: app.listen(8081, "127.0.0.1") });
 
     let adbClient;
+    let debuggerClient = null;
+    let debuggerGeneration = 0;
+    let debugLaunchPromise = null;
+    let debugLaunches = 0;
+    let resumeRequests = 0;
+    let lastSdbResponse = '';
+    let lastDebugError = null;
+    let lastDebugPort = null;
     let canLaunchInDebug = null;
     fetch('http://127.0.0.1:8001/api/v2/').then(res => res.json())
         .then(json => {
@@ -86,48 +97,177 @@ module.exports.onStart = function () {
 
 
     function createAdbConnection(ip, mdl) {
+        if (debugLaunchPromise) return debugLaunchPromise;
+        lastSdbResponse = '';
+        lastDebugError = null;
+        lastDebugPort = null;
         deviceIP = ip;
-        if (adbClient) {
-            if (!adbClient._stream) {
-                adbClient._stream.removeAllListeners('connect');
-                adbClient._stream.removeAllListeners('error');
-                adbClient._stream.removeAllListeners('close');
-            }
+        if (adbClient && adbClient._stream) {
+            adbClient._stream.removeAllListeners('connect');
+            adbClient._stream.removeAllListeners('error');
+            adbClient._stream.removeAllListeners('close');
+            adbClient._stream.end();
         }
-
-        adbClient = adbhost.createConnection({ host: '127.0.0.1', port: 26101 });
-
-        adbClient._stream.on('connect', () => {
-            console.log('ADB connection established');
-            //Launch app
-            const tbPackageId = tizen.application.getAppInfo().packageId;
-            const shellCmd = adbClient.createStream(`shell:0 debug ${tbPackageId}.TizenBrewStandalone${isTizen3 ? ' 0' : ''}`);
-            shellCmd.on('data', function dataIncoming(data) {
-                const dataString = data.toString();
-                if (dataString.includes('debug')) {
-                    const port = Number(dataString.substr(dataString.indexOf(':') + 1, 6).replace(' ', ''));
-                    startDebugging(port, queuedEvents, services, ip, mdl, inDebug, appControlData, false);
-                    setTimeout(() => adbClient._stream.end(), 1000);
+        const previousClient = debuggerClient;
+        const generation = ++debuggerGeneration;
+        debuggerClient = null;
+        if (previousClient && previousClient.close) Promise.resolve(previousClient.close()).catch(() => {});
+        inDebug.tizenDebug = true;
+        inDebug.webDebug = false;
+        const pending = new Promise((resolve, reject) => {
+            let startedDebugger = false;
+            let settled = false;
+            let response = '';
+            let connection;
+            const isCurrent = () => generation === debuggerGeneration;
+            const timeout = setTimeout(() => fail('Debugger launch timed out'), 12000);
+            function fail(message) {
+                if (settled) return;
+                settled = true;
+                lastDebugError = message;
+                clearTimeout(timeout);
+                if (isCurrent()) {
+                    debuggerGeneration++;
+                    debuggerClient = null;
+                    inDebug.tizenDebug = false;
+                    inDebug.webDebug = false;
                 }
-            });
+                if (connection && connection._stream) connection._stream.end();
+                reject(new Error(message));
+            }
+            const lifecycle = {
+                isCurrent,
+                onAttach(client) {
+                    if (!isCurrent() || settled) return;
+                    settled = true;
+                    clearTimeout(timeout);
+                    debuggerClient = client;
+                    debugLaunchPromise = null;
+                    resolve({ mode: 'debug' });
+                },
+                onDisconnect() {
+                    if (!isCurrent()) return;
+                    debuggerClient = null;
+                    debuggerGeneration++;
+                },
+                onFailure() { fail('Debugger attachment failed'); }
+            };
+            try {
+                connection = adbClient = adbhost.createConnection({ host: '127.0.0.1', port: 26101 });
+                connection._stream.on('connect', () => {
+                    if (!isCurrent() || settled) return;
+                    const tbPackageId = tizen.application.getAppInfo().packageId;
+                    debugLaunches++;
+                    const shellCmd = connection.createStream(`shell:0 debug ${tbPackageId}.TizenBrewStandalone${isTizen3 ? ' 0' : ''}`);
+                    function consumeResponse(final) {
+                        if (!isCurrent() || startedDebugger) return;
+                        const match = /\b(?:port|debug)\s*:\s*(\d+)(?=[\s,;\x00])/i.exec(response) ||
+                            (final && /\b(?:port|debug)\s*:\s*(\d+)$/i.exec(response));
+                        if (!match) return;
+                        const port = Number(match[1]);
+                        if (port < 1 || port > 65535) return fail('Invalid debugger port');
+                        lastDebugPort = port;
+                        startedDebugger = true;
+                        startDebugging(port, queuedEvents, services, ip, mdl, inDebug, appControlData, false, 1, lifecycle);
+                        setTimeout(() => connection._stream.end(), 1000);
+                    }
+                    shellCmd.on('data', data => {
+                        response = (response + data.toString()).slice(-8192);
+                        if (isCurrent()) lastSdbResponse = response.slice(-512);
+                        consumeResponse(false);
+                    });
+                    shellCmd.on('error', () => fail('Debugger command failed'));
+                    function finishResponse() { consumeResponse(true); if (!startedDebugger) fail('Debugger port missing'); }
+                    // adbhost handles SDB CLSE with Duplex.end(), which emits writable finish.
+                    shellCmd.on('finish', finishResponse);
+                    shellCmd.on('end', finishResponse);
+                });
+                connection._stream.on('error', () => fail('ADB connection failed'));
+                connection._stream.on('close', () => { if (!startedDebugger) fail('ADB connection closed'); });
+            } catch (error) { fail('ADB connection failed'); }
         });
+        debugLaunchPromise = pending;
+        const clearPending = () => { if (debugLaunchPromise === pending) debugLaunchPromise = null; };
+        pending.then(clearPending, clearPending);
+        return pending;
+    }
 
-        adbClient._stream.on('error', (e) => {
-            console.log('ADB connection error. ' + e);
-        });
-        adbClient._stream.on('close', () => {
-            console.log('ADB connection closed.');
+    function withTimeout(promise, milliseconds) {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                const error = new Error('Operation timed out');
+                error.code = 'PROBE_TIMEOUT';
+                reject(error);
+            }, milliseconds);
+            Promise.resolve(promise).then(value => { clearTimeout(timer); resolve(value); }, error => { clearTimeout(timer); reject(error); });
         });
     }
+
+    function matchesAutolaunchTarget(currentUrl) {
+        const target = modulesCache && modulesCache.find(m => m.fullName === readConfig().autoLaunchModule);
+        if (!target || !target.appPath) return false;
+        const current = url.parse(currentUrl);
+        const expected = url.parse(target.appPath);
+        const host = value => value === 'www.youtube.com' ? 'youtube.com' : value;
+        return host(current.hostname) === host(expected.hostname) && current.pathname === expected.pathname;
+    }
+
+    function launchFromRemote() {
+        if (debugLaunchPromise) return debugLaunchPromise;
+        const client = debuggerClient;
+        const generation = debuggerGeneration;
+        if (!client) return createAdbConnection('127.0.0.1', currentModule);
+        let history;
+        try { history = client.Page.getNavigationHistory(); } catch (error) { return createAdbConnection('127.0.0.1', currentModule); }
+        return withTimeout(history, 1000).then(result => {
+            if (client !== debuggerClient || generation !== debuggerGeneration) throw new Error('Debugger session changed');
+            const entry = result.entries && result.entries[result.currentIndex];
+            if (!entry || !matchesAutolaunchTarget(entry.url)) {
+                const error = new Error('Active page differs from autolaunch target');
+                error.code = 'ACTIVE_PAGE';
+                throw error;
+            }
+            return new Promise((resolve, reject) => {
+                let settled = false;
+                const timeout = setTimeout(() => finish(new Error('Native resume request timed out')), 3000);
+                function finish(error) {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timeout);
+                    if (client !== debuggerClient || generation !== debuggerGeneration) return reject(new Error('Debugger session changed'));
+                    if (error) return reject(error);
+                    resolve({ mode: 'resume' });
+                }
+                try {
+                    const appId = tizen.application.getAppInfo().packageId + '.TizenBrewStandalone';
+                    // Match the manifest's reload-disabled resume operation.
+                    const control = new tizen.ApplicationControl('http://samsung.com/appcontrol/operation/eden_resume');
+                    resumeRequests++;
+                    tizen.application.launchAppControl(control, appId, () => finish(),
+                        () => finish(new Error('Native resume request failed')));
+                } catch (error) { finish(new Error('Native resume request failed')); }
+            });
+        }, error => {
+            if (client !== debuggerClient || generation !== debuggerGeneration) throw new Error('Debugger session changed');
+            if (error.code === 'PROBE_TIMEOUT') throw error;
+            return createAdbConnection('127.0.0.1', currentModule);
+        });
+    }
+
+    startRemoteLauncher(readConfig().remoteLauncher, {
+        isReady: () => canLaunchInDebug === true && modulesCache !== null,
+        isAttached: () => !!debuggerClient,
+        getStatus: () => ({ debugLaunches, resumeRequests, lastSdbResponse, lastDebugError, lastDebugPort }),
+        launch: launchFromRemote
+    });
 
 
     wsServer.on('connection', (ws) => {
         const wsConn = new Connection(ws);
-        for (const event of queuedEvents) {
-            wsConn.send(event);
-            queuedEvents.splice(queuedEvents.indexOf(event), 1);
-        }
-        services.set('wsConn', wsConn);
+        ws.on('close', () => {
+            wsConn.isReady = false;
+            if (services.get('wsConn') === wsConn) services.delete('wsConn');
+        });
         ws.on('message', (message) => {
             let msg;
             try {
@@ -170,14 +310,11 @@ module.exports.onStart = function () {
                 }
                 case Events.ReLaunchInDebug: {
                     setTimeout(() => {
-                        createAdbConnection(payload.tvIP, currentModule);
+                        createAdbConnection(payload.tvIP, currentModule).catch(() => {});
                     }, 1000);
                     break;
                 }
                 case Events.GetModules: {
-                    wsConn.isReady = true;
-                    services.set('wsConn', wsConn);
-
                     if (payload) {
                         loadModules().then(modules => {
                             modulesCache = modules;
@@ -273,6 +410,10 @@ module.exports.onStart = function () {
                 case Events.Ready: {
                     wsConn.isReady = true;
                     services.set('wsConn', wsConn);
+                    while (queuedEvents.length > 0) {
+                        wsConn.send(queuedEvents.shift());
+                    }
+                    sendLaunchInformation(services, inDebug, appControlData);
                     break;
                 }
                 default: {

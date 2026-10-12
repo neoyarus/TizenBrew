@@ -19,6 +19,8 @@ window.addEventListener('keydown', (e) => {
         }
     } else if (e.keyCode === 38) {
         window.shouldDisableAutoLaunch = true;
+        window.state?.client?.cancelAutoLaunch();
+        window.dispatch?.({ type: 'SET_STARTUP_PENDING', payload: false });
     }
 });
 try {

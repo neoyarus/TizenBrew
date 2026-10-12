@@ -11,6 +11,11 @@
     <feature name="http://tizen.org/feature/screen.size.all"/>
     <feature name="http://tizen.org/feature/web.service"/>
     <icon src="icon.png"/>
+    <!-- Samsung TV native splash; first paint hands over to the matching HTML splash. -->
+    <tizen:video_splash_screen ready_when="first-paint">
+        <tizen:vss_default video="res/youtube-tv-native-splash.mp4" background_image="res/youtube-tv-native-splash.png" background_color="#282828" image="res/youtube-tv-native-splash.png" image_border="0px stretch"/>
+        <tizen:vss_landscape video="res/youtube-tv-native-splash.mp4" background_image="res/youtube-tv-native-splash.png" background_color="#282828" image="res/youtube-tv-native-splash.png" image_border="0px stretch"/>
+    </tizen:video_splash_screen>
     <tizen:metadata key="http://samsung.com/tv/metadata/prelaunch.support" value="true"/>
     <tizen:metadata key="http://samsung.com/tv/metadata/floating.navigation" value="false"/>
     <tizen:metadata key="http://samsung.com/tv/metadata/use.game.mode" value="true"/>
