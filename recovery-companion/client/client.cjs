@@ -7,12 +7,15 @@ const net = require('node:net');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { canonical, constants, validateWidgetAsync } = require('../service/core.cjs');
+const { parseCommand, transportCode } = require('../service/tvRemote.cjs');
+const { createNativeRemote } = require('./nativeRemote.cjs');
 
 function createClient(config, dependencies = {}) {
   if (!config || typeof config.host !== 'string' || !/^[a-zA-Z0-9.:-]+$/.test(config.host) || !Number.isInteger(config.port) || config.port < 1024 || config.port > 65535 ||
       !/^[a-f0-9]{64}$/.test(config.certificateSha256) || typeof config.privateKeyPath !== 'string') throw new Error('Invalid client configuration');
   const privateKey = fs.readFileSync(config.privateKeyPath);
   const expectedPin = Buffer.from(config.certificateSha256, 'hex');
+  const nativeRemote = config.tvRemoteToken === undefined ? null : createNativeRemote(config, dependencies.nativeRemote);
   const agent = new https.Agent({ keepAlive: false });
   agent.createConnection = function (options, callback) {
     let completed = false;
@@ -70,7 +73,10 @@ function createClient(config, dependencies = {}) {
           let result;
           try { result = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
           catch (error) { return reject(new Error('Invalid recovery response')); }
-          if (response.statusCode < 200 || response.statusCode >= 300) return reject(Object.assign(new Error('Recovery request refused (' + response.statusCode + '): ' + (result.error || 'Unknown error')), { code: 'STATUS_' + response.statusCode }));
+          if (response.statusCode < 200 || response.statusCode >= 300) return reject(Object.assign(new Error('Recovery request refused (' + response.statusCode + '): ' + (result.error || 'Unknown error')), {
+            code: 'STATUS_' + response.statusCode, transportCode: result.transportCode ? transportCode({ code: result.transportCode }) : undefined,
+            diagnosticDetail: typeof result.diagnosticDetail === 'string' ? result.diagnosticDetail.replace(/(?:https?|wss?):\/\/[^\s"'<>)]*/gi, '[url]').replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 256) : undefined
+          }));
           resolve(result);
         });
       });
@@ -100,8 +106,13 @@ function createClient(config, dependencies = {}) {
     await new Promise((resolve, reject) => validateWidgetAsync(body, (error, result) => error ? reject(error) : resolve(result)));
     return authenticated('POST', '/install', body, { 'Content-Type': 'application/octet-stream', 'x-widget-signature': sign(body) });
   }
+  function remote(key, holdMs) {
+    const command = parseCommand({ key, holdMs });
+    if (nativeRemote) return nativeRemote.execute(command);
+    return authenticated('POST', '/remote', Buffer.from(JSON.stringify(command)), { 'Content-Type': 'application/json' });
+  }
   async function tunnel(localPort = 26102) {
-    if (!Number.isInteger(localPort) || localPort < 1024 || localPort > 65535) throw new Error('Invalid local port');
+    if (!Number.isInteger(localPort) || localPort !== 0 && localPort < 1024 || localPort > 65535) throw new Error('Invalid local port');
     // Verify authorization and the server pin before advertising a usable PC listener.
     await authenticated('GET', '/status');
     const connections = new Set();
@@ -126,7 +137,7 @@ function createClient(config, dependencies = {}) {
       }).catch(() => socket.destroy());
     });
     await new Promise((resolve, reject) => { local.once('error', reject); local.listen(localPort, '127.0.0.1', resolve); });
-    return { port: localPort, server: local, close() { connections.forEach(socket => socket.destroy()); local.close(); } };
+    return { port: local.address().port, server: local, close() { connections.forEach(socket => socket.destroy()); local.close(); } };
   }
   async function startCompanion() {
     await new Promise((resolve, reject) => {
@@ -157,7 +168,8 @@ function createClient(config, dependencies = {}) {
     }
     throw new Error('Native launch acknowledged; authenticated recovery readiness was not confirmed');
   }
-  return { status: () => authenticated('GET', '/status'), start: startCompanion, install, tunnel, close: () => agent.destroy() };
+  return { status: () => authenticated('GET', '/status'), capabilities: () => authenticated('GET', '/capabilities'), start: startCompanion, install, remote, tunnel,
+    close() { if (nativeRemote) nativeRemote.close(); agent.destroy(); } };
 }
 
 module.exports = { createClient };

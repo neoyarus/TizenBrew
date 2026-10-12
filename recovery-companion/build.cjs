@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
+const { copyRemoteConfig } = require('./service/config.cjs');
 
 function readPrivateConfig(input) {
     if (!path.isAbsolute(input)) throw new Error('--config must name an absolute path');
@@ -22,7 +23,7 @@ function readPrivateConfig(input) {
     const certificate = new crypto.X509Certificate(config.tlsCert);
     if (!certificate.checkPrivateKey(privateKey)) throw new Error('TLS certificate and server key do not match');
     if (config.port !== undefined && config.port !== 8098) throw new Error('The companion endpoint uses port 8098');
-    return { publicKey: config.publicKey, tlsKey: config.tlsKey, tlsCert: config.tlsCert, port: 8098 };
+    return copyRemoteConfig(config, { publicKey: config.publicKey, tlsKey: config.tlsKey, tlsCert: config.tlsCert, port: 8098 });
 }
 
 // A deterministic PNG icon generated from a small original R glyph; no external artwork.

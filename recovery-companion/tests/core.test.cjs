@@ -56,7 +56,7 @@ function fakeSocket() {
   socket.pipe = () => {};
   return socket;
 }
-function fixture() {
+function fixture(platform = {}) {
   let now = 1000, timerId = 0, handler;
   const timers = new Map(), files = new Map(), writes = [], commands = [], targets = [];
   const server = new EventEmitter();
@@ -64,9 +64,12 @@ function fixture() {
   server.close = () => { server.closed = true; };
   server.setTimeout = () => {};
   const shell = new EventEmitter(), adbStream = fakeSocket();
-  const handle = start({ publicKey: keys.publicKey, tlsKey: 'private test stub', tlsCert: 'public test stub', port: 8098 }, {
+  const handle = start({ publicKey: keys.publicKey, tlsKey: 'private test stub', tlsCert: 'public test stub', port: 8098, ...platform.options }, {
     https: { createServer(options, fn) { assert.equal(options.secureProtocol, 'TLSv1_2_method'); assert.equal(options.handshakeTimeout, 10000); handler = fn; return server; } },
-    fs: { existsSync: () => true, writeFileSync(path, data, options) { assert.equal(files.has(path), false); files.set(path, data); writes.push({ path, options }); }, unlinkSync: path => files.delete(path) },
+    fs: { existsSync: () => true, writeFileSync(path, data, options) { assert.equal(files.has(path), false); files.set(path, data); writes.push({ path, options }); }, unlinkSync: path => files.delete(path), ...platform.fs },
+    os: platform.os,
+    process: platform.process,
+    WebSocket: platform.WebSocket,
     net: { connect(target) { targets.push(target); const socket = fakeSocket(); targets[targets.length - 1].socket = socket; return socket; } },
     adbhost: { createConnection(target) { assert.deepEqual(target, { host: '127.0.0.1', port: 26101 }); return { _stream: adbStream, createStream(command) { commands.push(command); return shell; } }; } },
     now: () => now,
@@ -132,6 +135,166 @@ test('public challenges are bounded and status logs require authentication', () 
   assert.equal(h.request('GET', '/challenge', Buffer.alloc(0), {}, false).res.status, 429);
   h.advance(30000);
   assert.equal(h.request('GET', '/challenge', Buffer.alloc(0), {}, false).res.status, 200);
+});
+
+test('capabilities require route-bound authentication and an empty body before reading platform metadata', () => {
+  let reads = 0;
+  const h = fixture({ fs: { openSync() { reads++; throw new Error('Denied'); } } });
+  assert.equal(h.request('GET', '/capabilities', Buffer.alloc(0), {}, false).res.status, 401);
+  assert.equal(h.request('GET', '/capabilities', Buffer.alloc(0), h.authHeaders('GET', '/status'), false).res.status, 401);
+  assert.equal(h.request('GET', '/capabilities', Buffer.from('anything')).res.status, 400);
+  assert.equal(h.request('GET', '/capabilities', Buffer.alloc(0), { 'transfer-encoding': 'chunked' }).res.status, 400);
+  assert.equal(reads, 0);
+  assert.equal(h.commands.length, 0);
+  assert.equal(h.request('GET', '/capabilities').res.status, 200);
+  assert.ok(reads > 0);
+  assert.equal(h.commands.length, 0);
+});
+
+test('capabilities expose a bounded boot digest and OS uptime without advertising unverified full-TV actions', () => {
+  const bootId = '00000000-1111-2222-3333-444444444444';
+  const reads = [], closed = [];
+  const h = fixture({ fs: {
+    openSync(path, flags) { assert.equal(path, '/proc/sys/kernel/random/boot_id'); assert.equal(flags, 'r'); return 9; },
+    readSync(fd, buffer, offset, length, position) { reads.push({ fd, offset, length, position }); return buffer.write(bootId + '\n'); },
+    closeSync(fd) { closed.push(fd); }
+  }, os: { uptime: () => 1234.75 } });
+  const result = h.request('GET', '/capabilities').res.body;
+  assert.deepEqual(reads, [{ fd: 9, offset: 0, length: 128, position: 0 }]);
+  assert.deepEqual(closed, [9]);
+  assert.equal(result.bootIdHash, crypto.createHash('sha256').update(bootId).digest('hex'));
+  assert.equal(result.uptimeSeconds, 1234);
+  assert.equal(JSON.stringify(result).includes(bootId), false);
+  assert.deepEqual(result.runtime, { node: process.version, platform: process.platform, architecture: process.arch,
+    uid: process.getuid ? process.getuid() : null, gid: process.getgid ? process.getgid() : null,
+    localIPv4: [] });
+  for (const name of ['fullTvScreen', 'osReboot']) {
+    assert.equal(result.operations[name].state, 'unavailable');
+    assert.equal(result.operations[name].verification, 'unverified');
+    assert.equal(result.operations[name].backend, null);
+  }
+  assert.equal(result.operations.fullTvScreen.scope, 'full-tv');
+  assert.equal(result.operations.osReboot.scope, 'full-os');
+  assert.equal(h.commands.length, 0);
+  assert.equal(h.request('POST', '/reboot').res.status, 404);
+  assert.equal(h.request('GET', '/screen').res.status, 404);
+});
+
+test('missing, malformed or denied boot metadata and uptime are reported as unknown', () => {
+  for (const failRead of [false, true]) {
+    const closed = [];
+    const h = fixture({ fs: {
+      openSync(path) { if (path !== '/proc/sys/kernel/random/boot_id') throw new Error('Unavailable'); return 7; },
+      readSync(fd, buffer) { if (failRead) throw new Error('Denied'); return buffer.write('not a kernel boot ID'); },
+      closeSync(fd) { closed.push(fd); }
+    }, os: { uptime() { if (failRead) throw new Error('Unavailable'); return NaN; } } });
+    const result = h.request('GET', '/capabilities').res.body;
+    assert.equal(result.bootIdHash, null);
+    assert.equal(result.uptimeSeconds, null);
+    assert.deepEqual(closed, [7]);
+  }
+});
+
+test('runtime identity reflects only finite nonnegative integer UID/GID values or unknown', () => {
+  const known = fixture({ process: { getuid: () => 0, getgid: () => 1001 } }).request('GET', '/capabilities').res.body.runtime;
+  assert.equal(known.uid, 0); assert.equal(known.gid, 1001);
+  for (const value of [-1, NaN, Infinity, 1.5, 4294967296, '0']) {
+    const runtime = fixture({ process: { getuid: () => value, getgid() { throw new Error('Unsupported'); } } }).request('GET', '/capabilities').res.body.runtime;
+    assert.equal(runtime.uid, null); assert.equal(runtime.gid, null);
+  }
+});
+
+function remoteFixture() {
+  const sockets = [];
+  class WebSocket extends EventEmitter {
+    constructor(url, options) { super(); this.readyState = 1; this.url = url; this.sent = []; sockets.push(this); }
+    send(value, callback) { this.sent.push(JSON.parse(value)); callback(); }
+    close() { this.readyState = 3; this.emit('close'); }
+    terminate() { this.readyState = 3; }
+  }
+  const h = fixture({ options: { tvRemoteToken: 'private-remote-fixture', tvRemoteName: 'HomeAssistant' }, WebSocket });
+  return { ...h, sockets,
+    remote(value, headers = {}, auth = true, emitEnd = true) { return h.request('POST', '/remote', Buffer.from(JSON.stringify(value)), { 'content-type': 'application/json', ...headers }, auth, emitEnd); },
+    ready() { sockets[sockets.length - 1].emit('message', JSON.stringify({ event: 'ms.channel.connect' })); }
+  };
+}
+
+test('remote endpoint authenticates and verifies JSON body binding and framing before opening native transport', () => {
+  const h = remoteFixture(), command = { key: 'KEY_HOME' };
+  assert.equal(h.remote(command, {}, false).res.status, 401);
+  assert.equal(h.remote(command, { 'transfer-encoding': 'chunked' }).res.status, 400);
+  assert.equal(h.remote(command, { 'content-length': '999' }).res.status, 400);
+  assert.equal(h.remote(command, { 'content-type': 'text/plain' }).res.status, 400);
+  assert.equal(h.remote({ key: 'KEY_HOME', host: 'external' }).res.status, 400);
+  assert.equal(h.remote({ key: 'KEY_UNKNOWN' }).res.status, 400);
+  assert.equal(h.remote({ key: 'KEY_HOME', holdMs: 1 }).res.status, 400);
+  assert.equal(h.remote({ key: 'x'.repeat(300) }).res.status, 400);
+  const originalBody = Buffer.from(JSON.stringify(command));
+  const headers = { ...h.authHeaders('POST', '/remote', originalBody), 'content-type': 'application/json' };
+  const altered = Buffer.from(JSON.stringify({ key: 'KEY_MENU' }));
+  assert.equal(h.request('POST', '/remote', altered, headers, false).res.status, 400);
+  assert.equal(h.request('POST', '/remote', originalBody, headers, false).res.status, 401);
+  assert.equal(h.sockets.length, 0);
+  assert.equal(h.commands.length, 0);
+});
+
+test('remote route is disabled without private configuration and never exposes its token', async () => {
+  const disabled = fixture();
+  assert.equal(disabled.request('GET', '/capabilities').res.body.operations.remoteKeys.state, 'unavailable');
+  assert.equal(disabled.request('POST', '/remote', Buffer.from('{"key":"KEY_HOME"}'), { 'content-type': 'application/json' }).res.status, 409);
+  const h = remoteFixture();
+  const capabilities = h.request('GET', '/capabilities').res.body;
+  assert.equal(capabilities.operations.remoteKeys.state, 'implemented');
+  assert.equal(JSON.stringify(capabilities).includes('private-remote-fixture'), false);
+  const request = h.remote({ key: 'KEY_HOME' });
+  h.ready();
+  await request.res.done;
+  assert.equal(request.res.status, 200);
+  assert.equal(request.res.body.sent, true);
+  assert.equal(JSON.stringify(request.res.body).includes('private-remote-fixture'), false);
+});
+
+test('remote HTTP failures expose sanitized transport codes without leaking native error details', async () => {
+  const h = remoteFixture();
+  const request = h.remote({ key: 'KEY_HOME' });
+  h.sockets[0].emit('error', Object.assign(new Error('private-remote-fixture wss://private-native-url'), { code: 'ECONNREFUSED' }));
+  await request.res.done;
+  assert.equal(request.res.status, 502);
+  assert.deepEqual(request.res.body, { error: 'TV remote connection failed', code: 'REMOTE_SEND_FAILED', transportCode: 'ECONNREFUSED', diagnosticDetail: 'Error: [redacted] [url]' });
+  assert.equal(JSON.stringify(request.res.body).includes('private'), false);
+});
+
+test('remote body deadlines and command serialization release their slots safely', async () => {
+  const h = remoteFixture();
+  const stalled = h.remote({ key: 'KEY_HOME' }, {}, true, false);
+  assert.equal(h.remote({ key: 'KEY_HOME' }).res.status, 409);
+  h.advance(10000);
+  assert.equal(stalled.req.destroyed, true);
+  assert.equal(h.sockets.length, 0);
+  const first = h.remote({ key: 'KEY_UP', holdMs: 500 });
+  h.ready();
+  assert.equal(h.remote({ key: 'KEY_DOWN' }).res.status, 409);
+  h.advance(500); await first.res.done;
+  assert.equal(first.res.status, 200);
+  const next = h.remote({ key: 'KEY_DOWN' }); h.ready(); await next.res.done;
+  assert.equal(next.res.status, 200);
+});
+
+test('power commands are rejected during upload, install and inconclusive updates; active power blocks an installer', async () => {
+  for (const state of ['upload', 'install', 'inconclusive']) {
+    const h = remoteFixture();
+    if (state === 'upload') h.request('POST', '/install', zip(), { 'content-type': 'application/octet-stream', 'x-widget-signature': signature(zip()) }, true, false);
+    else { await h.install().res.done; if (state === 'inconclusive') h.advance(120000); }
+    assert.equal(h.remote({ key: 'KEY_POWER', holdMs: 5000 }).res.status, 409);
+    assert.equal(h.sockets.length, 0);
+  }
+  const h = remoteFixture();
+  const power = h.remote({ key: 'KEY_POWER', holdMs: 500 }); h.ready();
+  assert.equal(h.install().res.status, 409);
+  assert.equal(h.commands.length, 0);
+  h.advance(500); await power.res.done;
+  await h.install().res.done;
+  assert.equal(h.commands.length, 1);
 });
 
 test('stored and deflated manifests accept only the fixed target', async () => {
@@ -268,23 +431,43 @@ test('real pinned TLS client rejects wrong pin and wrong key, and proxies raw TC
   const fixtureKey = require('node:path').join(require('node:os').tmpdir(), 'recovery-fixture-' + crypto.randomBytes(8).toString('hex') + '.pem');
   fs.writeFileSync(fixtureKey, keys.privateKey, { mode: 384 });
   t.after(() => fs.unlinkSync(fixtureKey));
-  const serverConfig = { publicKey: keys.publicKey, tlsKey: tlsKeys.privateKey, tlsCert: certPem, port: 8098 };
+  const serverConfig = { publicKey: keys.publicKey, tlsKey: tlsKeys.privateKey, tlsCert: certPem, port: 8098, tvRemoteToken: 'private-tls-fixture-token' };
   const clientConfig = { privateKeyPath: fixtureKey, certificateSha256: crypto.createHash('sha256').update(certDer).digest('hex') };
   const echo = net.createServer(socket => { socket.on('error', () => {}); socket.pipe(socket); });
   echo.listen(0, '127.0.0.1');
   await once(echo, 'listening');
   const destinations = [];
+  const remotePackets = [];
+  class NativeRemoteStub extends EventEmitter {
+    constructor(url) { super(); this.readyState = 1; assert.ok(url.startsWith('wss://127.0.0.1:8002/')); process.nextTick(() => {
+      if (NativeRemoteStub.failure) this.emit('error', Object.assign(new Error('private-tls-fixture-token'), { code: NativeRemoteStub.failure }));
+      else this.emit('message', '{"event":"ms.channel.connect"}');
+    }); }
+    send(packet, callback) { remotePackets.push(JSON.parse(packet)); callback(); }
+    close() { this.readyState = 3; this.emit('close'); }
+    terminate() { this.readyState = 3; }
+  }
   let receivedHttpRequests = 0;
   const handle = start(serverConfig, { https: { createServer(options, handler) {
     const server = https.createServer(options, (request, response) => { receivedHttpRequests++; handler(request, response); }), listen = server.listen.bind(server);
     server.listen = () => listen(0, '127.0.0.1');
     return server;
-  } }, now: () => Date.now() - 86400000, net: { connect(target) { destinations.push(target); return net.connect(echo.address().port, '127.0.0.1'); } } });
+  } }, WebSocket: NativeRemoteStub, now: () => Date.now() - 86400000, net: { connect(target) { destinations.push(target); return net.connect(echo.address().port, '127.0.0.1'); } } });
   await once(handle.server, 'listening');
   const good = { ...clientConfig, host: '127.0.0.1', port: handle.server.address().port };
   const client = createClient(good);
   t.after(() => { client.close(); handle.close(); echo.close(); });
   assert.equal((await client.status()).target, constants.TARGET);
+  const capabilities = await client.capabilities();
+  assert.equal(capabilities.protocol, 'TBRC1');
+  assert.equal(capabilities.operations.osReboot.verification, 'unverified');
+  assert.equal((await client.remote('KEY_HOME')).sent, true);
+  assert.equal(remotePackets[0].params.Cmd, 'Click');
+  assert.equal(remotePackets[0].params.DataOfCmd, 'KEY_HOME');
+  assert.equal(JSON.stringify(capabilities).includes('private-tls-fixture-token'), false);
+  NativeRemoteStub.failure = 'ECONNREFUSED';
+  await assert.rejects(client.remote('KEY_HOME'), error => error.transportCode === 'ECONNREFUSED' && !error.message.includes('private-tls-fixture-token'));
+  NativeRemoteStub.failure = null;
   const countBeforeBadPin = receivedHttpRequests;
   const badPin = createClient({ ...good, certificateSha256: '0'.repeat(64) });
   await assert.rejects(badPin.status(), /pin mismatch/);
@@ -294,8 +477,8 @@ test('real pinned TLS client rejects wrong pin and wrong key, and proxies raw TC
   fs.writeFileSync(tempKey, tlsKeys.privateKey, { mode: 384 });
   const badKey = createClient({ ...good, privateKeyPath: tempKey });
   try { await assert.rejects(badKey.status(), /401/); } finally { badKey.close(); fs.unlinkSync(tempKey); }
-  const tunnel = await client.tunnel(26102);
-  const socket = net.connect(26102, '127.0.0.1');
+  const tunnel = await client.tunnel(0);
+  const socket = net.connect(tunnel.port, '127.0.0.1');
   const data = once(socket, 'data');
   socket.on('error', () => {});
   socket.write(Buffer.from('opaque SDB payload'));

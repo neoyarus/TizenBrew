@@ -6,6 +6,9 @@ var crypto = require('crypto');
 var fs = require('fs');
 var net = require('net');
 var zlib = require('zlib');
+var os = require('os');
+var tvRemote = require('./tvRemote.cjs');
+var framebufferProbe = require('./framebufferProbe.cjs');
 var TARGET = 'xvvl3S1bvH';
 var APP_ID = TARGET + '.TizenBrewStandalone';
 var STAGE = '/home/owner/share/tmp/sdk_tools';
@@ -160,6 +163,9 @@ function start(options, dependencies) {
   var closed = false;
   var installClient;
   var installTimer;
+  var remoteRequestBusy = false;
+  var remotePowerBusy = false;
+  var remote = tvRemote.create(options, { WebSocket: deps.WebSocket, os: deps.os, setTimeout: later, clearTimeout: cancel });
   var state = { phase: 'ready', operation: 0, result: null, log: '', tunnels: 0 };
 
   function send(response, status, value) {
@@ -180,6 +186,51 @@ function start(options, dependencies) {
   }
   function empty(request, auth) {
     return auth && auth.bytes === 0 && auth.hash === EMPTY_HASH && !request.headers['transfer-encoding'] && (!request.headers['content-length'] || request.headers['content-length'] === '0');
+  }
+  function capabilities() {
+    // Read a fixed, small kernel identifier. Return only its digest, never the ID.
+    var bootIdHash = null;
+    var descriptor;
+    try {
+      descriptor = disk.openSync('/proc/sys/kernel/random/boot_id', 'r');
+      var buffer = new Buffer(128);
+      var count = disk.readSync(descriptor, buffer, 0, buffer.length, 0);
+      var bootId = buffer.toString('utf8', 0, count).trim();
+      if (/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(bootId)) bootIdHash = crypto.createHash('sha256').update(bootId.toLowerCase()).digest('hex');
+    } catch (ignored) {}
+    finally { if (descriptor !== undefined) { try { disk.closeSync(descriptor); } catch (ignoredClose) {} } }
+    var uptimeSeconds = null;
+    try {
+      var uptime = (deps.os || os).uptime();
+      if (typeof uptime === 'number' && isFinite(uptime) && uptime >= 0) uptimeSeconds = Math.floor(uptime);
+    } catch (ignoredUptime) {}
+    function identity(method) {
+      try {
+        var runtimeProcess = deps.process || process;
+        var value = runtimeProcess[method]();
+        if (typeof value === 'number' && isFinite(value) && value >= 0 && value <= 4294967295 && value % 1 === 0) return value;
+      } catch (ignoredIdentity) {}
+      return null;
+    }
+    return {
+      protocol: 'TBRC1',
+      runtime: { node: process.version, platform: process.platform, architecture: process.arch, uid: identity('getuid'), gid: identity('getgid'), localIPv4: tvRemote.localAddresses(deps.os) },
+      bootIdHash: bootIdHash,
+      uptimeSeconds: uptimeSeconds,
+      framebufferAccess: framebufferProbe.probe(disk),
+      operations: {
+        status: { state: 'implemented', route: 'GET /status' },
+        signedUpdate: { state: 'implemented', route: 'POST /install', target: TARGET },
+        sdbTunnel: { state: 'implemented', route: 'CONNECT /sdb', requires: 'An authorized, running TV-local SDB daemon' },
+        remoteKeys: { state: remote.enabled ? 'implemented' : 'unavailable', route: 'POST /remote', keys: tvRemote.keys,
+          holdMinMs: 500, holdMaxMs: 10000, requires: 'A previously authorized TV-native remote token in private configuration',
+          scope: 'native-remote-keys' },
+        fullTvScreen: { state: 'unavailable', verification: 'unverified', scope: 'full-tv', backend: null,
+          reason: 'No full-TV screen capture backend has been verified with this service\'s permissions. App-document capture is a separate scope.' },
+        osReboot: { state: 'unavailable', verification: 'unverified', scope: 'full-os', backend: null,
+          reason: 'No full OS reboot backend has been verified with this service\'s permissions. Standby and remote power keys do not establish an OS reboot.' }
+      }
+    };
   }
   function directory(path) {
     if (disk.existsSync(path)) return;
@@ -246,8 +297,54 @@ function start(options, dependencies) {
       if (!empty(request, auth)) return send(response, 400, { error: 'Empty body required' });
       return send(response, 200, { phase: state.phase, operation: state.operation, result: state.result, log: state.log, tunnels: tunnels.length, target: TARGET });
     }
+    if (request.method === 'GET' && request.url === '/capabilities') {
+      if (!empty(request, auth)) return send(response, 400, { error: 'Empty body required' });
+      return send(response, 200, capabilities());
+    }
+    if (request.method === 'POST' && request.url === '/remote') {
+      if (!remote.enabled) return send(response, 409, { error: 'TV remote is not configured or available' });
+      if (remoteRequestBusy) return send(response, 409, { error: 'TV remote is busy' });
+      if (auth.bytes < 1 || auth.bytes > 256 || request.headers['content-length'] !== String(auth.bytes) || request.headers['transfer-encoding'] || request.headers['content-type'] !== 'application/json') return send(response, 400, { error: 'Invalid remote body' });
+      remoteRequestBusy = true;
+      var remoteChunks = [];
+      var remoteSize = 0;
+      var remoteEnded = false;
+      var remoteTimer = later(function () { abortRemote(); request.destroy(); }, 10000);
+      function abortRemote() { if (remoteEnded) return; remoteEnded = true; cancel(remoteTimer); remoteChunks = []; remoteRequestBusy = false; }
+      function rejectRemote(status, message) { remoteRequestBusy = false; send(response, status, { error: message }); }
+      request.on('aborted', abortRemote);
+      request.on('error', abortRemote);
+      request.on('data', function (chunk) {
+        if (remoteEnded) return;
+        remoteSize += chunk.length;
+        if (remoteSize > auth.bytes) { abortRemote(); send(response, 413, { error: 'Remote body size limit' }); request.destroy(); return; }
+        remoteChunks.push(chunk);
+      });
+      request.on('end', function () {
+        if (remoteEnded) return;
+        remoteEnded = true;
+        cancel(remoteTimer);
+        var remoteBody = Buffer.concat(remoteChunks);
+        remoteChunks = [];
+        if (remoteSize !== auth.bytes || crypto.createHash('sha256').update(remoteBody).digest('hex') !== auth.hash) return rejectRemote(400, 'Remote body checksum mismatch');
+        var command;
+        try { command = tvRemote.parseCommand(JSON.parse(remoteBody.toString('utf8'))); }
+        catch (ignoredRemoteBody) { return rejectRemote(400, 'Invalid remote command'); }
+        if (closed) return rejectRemote(503, 'Unavailable');
+        if (command.key === 'KEY_POWER' && uploadBusy) return rejectRemote(409, 'Power control unavailable during an update');
+        remotePowerBusy = command.key === 'KEY_POWER';
+        remote.execute(command, function (error, result) {
+          remoteRequestBusy = false;
+          remotePowerBusy = false;
+          if (error) return send(response, error.code === 'REMOTE_TIMEOUT' ? 504 : error.code === 'REMOTE_BUSY' || error.code === 'REMOTE_UNAVAILABLE' ? 409 : 502,
+            { error: error.message, code: error.code, transportCode: error.transportCode || null, diagnosticDetail: error.diagnosticDetail || null });
+          send(response, 200, result);
+        });
+      });
+      return;
+    }
     if (request.method !== 'POST' || request.url !== '/install') return send(response, 404, { error: 'Unknown route' });
-    if (uploadBusy) return send(response, 409, { error: 'Installer unavailable' });
+    if (uploadBusy || remotePowerBusy) return send(response, 409, { error: 'Installer unavailable' });
     if (auth.bytes < 1 || auth.bytes > LIMIT || request.headers['content-length'] !== String(auth.bytes) || request.headers['transfer-encoding'] || request.headers['content-type'] !== 'application/octet-stream') return send(response, 400, { error: 'Invalid widget body' });
     uploadBusy = true;
     var chunks = [];
@@ -333,6 +430,7 @@ function start(options, dependencies) {
     closed = true;
     nonces = Object.create(null);
     cancel(installTimer);
+    remote.close();
     tunnels.slice().forEach(function (tunnel) { tunnel.close(); });
     sockets.slice().forEach(function (socket) { socket.destroy(); });
     if (installClient && installClient._stream) installClient._stream.destroy();

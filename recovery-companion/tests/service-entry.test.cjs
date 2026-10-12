@@ -19,6 +19,7 @@ function harness(raw) {
         require(name) {
             if (name === 'fs') return { readFileSync(file) { reads.push(file); return raw; } };
             if (name === 'path') return path.posix;
+            if (name === './config.cjs') return require('../service/config.cjs');
             if (name === './core.cjs') return { start(options) {
                 starts.push(options);
                 const handle = { closed: false, isClosed() { return handle.closed; }, close() { handle.closed = true; closed++; } };
@@ -42,6 +43,26 @@ test('service entry reads packaged private configuration and remains idempotent 
     h.callbacks.onExit();
     h.callbacks.onStop();
     assert.equal(h.closed, 1);
+});
+
+test('service entry passes validated optional remote credentials without logging them', () => {
+    const h = harness(JSON.stringify({ publicKey: 'public', tlsKey: 'server-key', tlsCert: 'server-cert', port: 8098,
+        tvRemoteToken: 'PRIVATE_TEST_TOKEN', tvRemoteName: 'HomeAssistant', tvRemoteHost: '192.168.11.200' }));
+    h.callbacks.onStart();
+    assert.equal(h.starts[0].tvRemoteToken, 'PRIVATE_TEST_TOKEN');
+    assert.equal(h.starts[0].tvRemoteName, 'HomeAssistant');
+    assert.equal(h.starts[0].tvRemoteHost, '192.168.11.200');
+    assert.deepEqual(h.logs, []);
+});
+
+test('invalid remote credentials cannot start an endpoint or leak through startup errors', () => {
+    for (const remote of [{ tvRemoteToken: '' }, { tvRemoteToken: 'SENSITIVE'.repeat(129) }, { tvRemoteName: 'x'.repeat(65) }]) {
+        const h = harness(JSON.stringify({ publicKey: 'public', tlsKey: 'server-key', tlsCert: 'server-cert', port: 8098, ...remote }));
+        h.callbacks.onStart();
+        assert.equal(h.starts.length, 0);
+        assert.equal(h.logs.length, 1);
+        assert.doesNotMatch(h.logs[0], /SENSITIVE|server-key/);
+    }
 });
 
 test('a new service request retries a core that closed after a listener failure', () => {
