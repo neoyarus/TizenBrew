@@ -466,7 +466,8 @@ test('authenticated installer diagnostics record CNXN, OPEN and static terminal 
   assert.equal(h.request('GET', '/status').res.body.installDiagnostics, null);
   await h.install().res.done;
   assert.deepEqual(h.request('GET', '/status').res.body.installDiagnostics, {
-    cnxnSeen: false, openAccepted: false, writableFinished: false, terminalReason: null, transportCode: null
+    cnxnSeen: false, openAccepted: false, tcpConnected: false, tcpBytesRead: null, tcpBytesWritten: null,
+    writableFinished: false, terminalReason: null, transportCode: null
   });
   h.adbClient.emit('connect');
   h.shell.remoteId = () => -1;
@@ -477,11 +478,12 @@ test('authenticated installer diagnostics record CNXN, OPEN and static terminal 
   const cause = Object.assign(new Error('secret /home/owner/private.wgt wss://private.invalid'), { code: 'ECONNRESET' });
   h.adbStream.emit('error', cause);
   const diagnostics = h.request('GET', '/status').res.body.installDiagnostics;
-  assert.deepEqual(diagnostics, { cnxnSeen: true, openAccepted: true, writableFinished: true, terminalReason: 'transport-error', transportCode: 'ECONNRESET' });
+  assert.deepEqual(diagnostics, { cnxnSeen: true, openAccepted: true, tcpConnected: false, tcpBytesRead: null, tcpBytesWritten: null,
+    writableFinished: true, terminalReason: 'transport-error', transportCode: 'ECONNRESET' });
   assert.equal(JSON.stringify(diagnostics).includes('secret'), false);
   assert.equal(JSON.stringify(diagnostics).includes('/home'), false);
   assert.equal(h.request('GET', '/status', Buffer.alloc(0), {}, false).res.status, 401);
-  assert.equal(h.request('GET', '/capabilities').res.body.implementationVersion, '1.1.0');
+  assert.equal(h.request('GET', '/capabilities').res.body.implementationVersion, '1.1.2');
 });
 
 test('actual adbhost CNXN and accepted or rejected OPEN produce bounded diagnostic outcomes', async () => {
@@ -504,12 +506,35 @@ test('actual adbhost CNXN and accepted or rejected OPEN produce bounded diagnost
     await finished;
     assert.equal(h.handle.state.result, null, 'classification must wait for readable drain');
     h.advance(0);
-    assert.deepEqual(h.handle.state.installDiagnostics, { cnxnSeen: true, openAccepted: accepted,
+    assert.deepEqual(h.handle.state.installDiagnostics, { cnxnSeen: true, openAccepted: accepted, tcpConnected: false, tcpBytesRead: null, tcpBytesWritten: null,
       writableFinished: true, terminalReason: accepted ? 'stream-finish' : 'unacknowledged-stream-finish', transportCode: null });
     assert.equal(h.handle.state.result, 'inconclusive');
     assert.equal(h.files.size, 1);
     assert.equal(h.install().res.status, 409);
   }
+});
+
+test('TCP diagnostics sample only bounded byte counters and freeze the snapshot before transport teardown', async () => {
+  const h = fixture(); await h.install().res.done;
+  h.adbStream.bytesRead = 853; h.adbStream.bytesWritten = 91;
+  h.adbStream.emit('connect');
+  let diagnostics = h.request('GET', '/status').res.body.installDiagnostics;
+  assert.equal(diagnostics.tcpConnected, true);
+  assert.equal(diagnostics.tcpBytesRead, 853); assert.equal(diagnostics.tcpBytesWritten, 91);
+  assert.equal(diagnostics.cnxnSeen, false, 'TCP connection alone does not prove the SDB handshake');
+  for (const value of [-1, NaN, Infinity, '853', undefined]) {
+    h.adbStream.bytesRead = value; h.adbStream.bytesWritten = value;
+    diagnostics = h.request('GET', '/status').res.body.installDiagnostics;
+    assert.equal(diagnostics.tcpBytesRead, null); assert.equal(diagnostics.tcpBytesWritten, null);
+  }
+  h.adbStream.bytesRead = 1000000001; h.adbStream.bytesWritten = 97.9;
+  h.advance(120000);
+  diagnostics = h.request('GET', '/status').res.body.installDiagnostics;
+  assert.equal(diagnostics.tcpBytesRead, 1000000000); assert.equal(diagnostics.tcpBytesWritten, 97);
+  assert.equal(diagnostics.terminalReason, 'deadline');
+  h.adbStream.bytesRead = 0; h.adbStream.bytesWritten = 0;
+  diagnostics = h.request('GET', '/status').res.body.installDiagnostics;
+  assert.equal(diagnostics.tcpBytesRead, 1000000000); assert.equal(diagnostics.tcpBytesWritten, 97);
 });
 
 test('terminal installer diagnostic reasons preserve confirmed results and reject unknown raw error codes', async () => {
@@ -550,10 +575,13 @@ test('unauthenticated or altered tunnel requests cannot connect to any destinati
   assert.equal(h.targets.length, 0);
 });
 
-test('authenticated tunnels have a fixed destination, a two-connection cap, idle deadline and hard TTL', () => {
-  const h = fixture(), first = h.connect(), second = h.connect(), third = h.connect();
-  assert.equal(h.targets.length, 2);
-  assert.match(third.data.join(''), /409/);
+test('authenticated tunnels have a fixed destination, a one-connection cap, idle deadline and hard TTL', () => {
+  const h = fixture(), first = h.connect(), second = h.connect();
+  assert.equal(h.targets.length, 1);
+  assert.match(second.data.join(''), /409/);
+  const advertised = h.request('GET', '/capabilities').res.body.operations.sdbTunnel;
+  assert.equal(advertised.maxConnections, 1);
+  assert.equal(advertised.requiresExclusiveAccess, true);
   for (const target of h.targets) {
     assert.equal(target.host, '127.0.0.1');
     assert.equal(target.port, 26101);
@@ -565,6 +593,29 @@ test('authenticated tunnels have a fixed destination, a two-connection cap, idle
   h.advance(constants.TUNNEL_TTL);
   assert.ok(first.destroyed && second.destroyed && h.targets.every(target => target.socket.destroyed));
   assert.equal(h.request('GET', '/status').res.body.tunnels, 0);
+  const replacement = h.connect(); h.targets[1].socket.emit('connect');
+  assert.match(replacement.data.join(''), /200 Connection Established/);
+});
+
+test('an active or pending recovery tunnel rejects installs without staging or changing the previous operation', async () => {
+  for (const previous of ['ready', 'completed']) {
+    const h = fixture();
+    if (previous === 'completed') { await h.install().res.done; h.shell.emit('data', Buffer.from('install completed')); }
+    const tunnel = h.connect(); // Reserved even before the TV-local socket connects.
+    const before = structuredClone(h.handle.state), writes = h.writes.length, commands = h.commands.length;
+    const rejected = h.install(); await rejected.res.done;
+    assert.equal(rejected.res.status, 409);
+    assert.deepEqual(rejected.res.body, { error: 'Close the recovery SDB tunnel before installing' });
+    assert.deepEqual(h.handle.state, before);
+    assert.equal(h.writes.length, writes);
+    assert.equal(h.commands.length, commands);
+    assert.equal(h.files.size, 0);
+    tunnel.destroy();
+    const next = h.install(); await next.res.done;
+    assert.equal(next.res.status, 202);
+    assert.equal(h.handle.state.operation, before.operation + 1);
+    assert.equal(h.commands.length, commands + 1);
+  }
 });
 
 test('closing or listener failure exposes a closed handle and destroys all tunnel sockets', () => {

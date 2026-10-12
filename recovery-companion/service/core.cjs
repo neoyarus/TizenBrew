@@ -163,6 +163,7 @@ function start(options, dependencies) {
   var closed = false;
   var installClient;
   var installTimer;
+  var sampleInstallBytes;
   var remoteRequestBusy = false;
   var remotePowerBusy = false;
   var remote = tvRemote.create(options, { WebSocket: deps.WebSocket, os: deps.os, setTimeout: later, clearTimeout: cancel });
@@ -214,7 +215,7 @@ function start(options, dependencies) {
     }
     return {
       protocol: 'TBRC1',
-      implementationVersion: '1.1.0',
+      implementationVersion: '1.1.2',
       runtime: { node: process.version, platform: process.platform, architecture: process.arch, uid: identity('getuid'), gid: identity('getgid'), localIPv4: tvRemote.localAddresses(deps.os) },
       bootIdHash: bootIdHash,
       uptimeSeconds: uptimeSeconds,
@@ -222,7 +223,8 @@ function start(options, dependencies) {
       operations: {
         status: { state: 'implemented', route: 'GET /status' },
         signedUpdate: { state: 'implemented', route: 'POST /install', target: TARGET },
-        sdbTunnel: { state: 'implemented', route: 'CONNECT /sdb', requires: 'An authorized, running TV-local SDB daemon' },
+        sdbTunnel: { state: 'implemented', route: 'CONNECT /sdb', maxConnections: 1, requiresExclusiveAccess: true,
+          requires: 'An authorized, running TV-local SDB daemon with no other active SDB client' },
         remoteKeys: { state: remote.enabled ? 'implemented' : 'unavailable', route: 'POST /remote', keys: tvRemote.keys,
           holdMinMs: 500, holdMaxMs: 10000, requires: 'A previously authorized TV-native remote token in private configuration',
           scope: 'native-remote-keys' },
@@ -247,9 +249,20 @@ function start(options, dependencies) {
     state.result = null;
     state.log = '';
     var diagnostics = state.installDiagnostics = { cnxnSeen: false, openAccepted: false,
+      tcpConnected: false, tcpBytesRead: null, tcpBytesWritten: null,
       writableFinished: false, terminalReason: null, transportCode: null };
+    var installerStream;
+    function byteCount(value) {
+      return typeof value === 'number' && isFinite(value) && value >= 0 ? Math.min(1000000000, Math.floor(value)) : null;
+    }
+    sampleInstallBytes = function () {
+      if (!installerStream) return;
+      diagnostics.tcpBytesRead = byteCount(installerStream.bytesRead);
+      diagnostics.tcpBytesWritten = byteCount(installerStream.bytesWritten);
+    };
     function finish(result, reason, cause) {
       if (settled) return;
+      sampleInstallBytes();
       settled = true;
       cancel(installTimer);
       cancel(shellFinishTimer);
@@ -268,6 +281,8 @@ function start(options, dependencies) {
       disk.writeFileSync(stagePath, body, { flag: 'wx', mode: 384 });
       var adb = deps.adbhost || require('adbhost');
       installClient = adb.createConnection({ host: '127.0.0.1', port: 26101 });
+      installerStream = installClient._stream;
+      installerStream.on('connect', function () { if (!settled) diagnostics.tcpConnected = true; });
       installTimer = later(function () { finish('inconclusive', 'deadline'); }, 120000);
       installClient.on('connect', function () { if (!settled) diagnostics.cnxnSeen = true; });
       installClient._stream.on('error', function (cause) { finish('inconclusive', 'transport-error', cause); });
@@ -317,6 +332,7 @@ function start(options, dependencies) {
     if (!auth) return send(response, 401, { error: 'Authentication required' });
     if (request.method === 'GET' && request.url === '/status') {
       if (!empty(request, auth)) return send(response, 400, { error: 'Empty body required' });
+      if (state.phase === 'installing' && sampleInstallBytes) sampleInstallBytes();
       return send(response, 200, { phase: state.phase, operation: state.operation, result: state.result, log: state.log, tunnels: tunnels.length, target: TARGET,
         installDiagnostics: state.installDiagnostics });
     }
@@ -367,6 +383,7 @@ function start(options, dependencies) {
       return;
     }
     if (request.method !== 'POST' || request.url !== '/install') return send(response, 404, { error: 'Unknown route' });
+    if (tunnels.length) return send(response, 409, { error: 'Close the recovery SDB tunnel before installing' });
     if (uploadBusy || remotePowerBusy) return send(response, 409, { error: 'Installer unavailable' });
     if (auth.bytes < 1 || auth.bytes > LIMIT || request.headers['content-length'] !== String(auth.bytes) || request.headers['transfer-encoding'] || request.headers['content-type'] !== 'application/octet-stream') return send(response, 400, { error: 'Invalid widget body' });
     uploadBusy = true;
@@ -409,7 +426,7 @@ function start(options, dependencies) {
     if (request.url !== '/sdb' || !empty(request, auth) || head && head.length) return refuse('400 Bad Request');
     // A full-SDB operator must retain a repair path after an uncertain install.
     // Uploads/active installs still exclude new tunnels; install and power stay locked.
-    if (closed || uploadBusy && state.phase !== 'inconclusive' || tunnels.length >= 2) return refuse('409 Conflict');
+    if (closed || uploadBusy && state.phase !== 'inconclusive' || tunnels.length >= 1) return refuse('409 Conflict');
     var destination;
     var tunnel = { client: socket, destination: null, timer: null, closed: false };
     tunnels.push(tunnel);

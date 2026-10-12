@@ -82,6 +82,7 @@ async function build(input) {
     if (Object.keys(bundle.assets).length) throw new Error('Unexpected bundle assets require explicit packaging review');
     const compatible = babel.transformSync(bundle.code, {
         babelrc: false, configFile: false, compact: true,
+        plugins: [require('../build-support/adbhost-strict-fix.cjs')],
         presets: [['@babel/preset-env', { targets: { node: '4.4.3' }, forceAllTransforms: true }]]
     }).code;
     fs.mkdirSync(path.join(stage, 'service'), { recursive: true });

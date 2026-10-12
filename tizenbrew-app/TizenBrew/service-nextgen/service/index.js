@@ -227,11 +227,25 @@ module.exports.onStart = function () {
                 error.code = 'ACTIVE_PAGE';
                 throw error;
             }
-            const appId = tizen.application.getAppInfo().packageId + '.TizenBrewStandalone';
-            resumeRequests++;
-            return fetch('http://127.0.0.1:8001/api/v2/applications/' + appId, { method: 'POST', timeout: 3000 }).then(response => {
-                if (!response.ok) throw new Error('Resume request failed');
-                return { mode: 'resume' };
+            return new Promise((resolve, reject) => {
+                let settled = false;
+                const timeout = setTimeout(() => finish(new Error('Native resume request timed out')), 3000);
+                function finish(error) {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timeout);
+                    if (client !== debuggerClient || generation !== debuggerGeneration) return reject(new Error('Debugger session changed'));
+                    if (error) return reject(error);
+                    resolve({ mode: 'resume' });
+                }
+                try {
+                    const appId = tizen.application.getAppInfo().packageId + '.TizenBrewStandalone';
+                    // Match the manifest's reload-disabled resume operation.
+                    const control = new tizen.ApplicationControl('http://samsung.com/appcontrol/operation/eden_resume');
+                    resumeRequests++;
+                    tizen.application.launchAppControl(control, appId, () => finish(),
+                        () => finish(new Error('Native resume request failed')));
+                } catch (error) { finish(new Error('Native resume request failed')); }
             });
         }, error => {
             if (client !== debuggerClient || generation !== debuggerGeneration) throw new Error('Debugger session changed');

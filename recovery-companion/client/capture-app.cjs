@@ -72,6 +72,70 @@ function getTargets(port, timeout = 3000) {
   });
 }
 
+function readLauncherToken(config, io = fs) {
+  if (config.tizenbrewLauncherTokenPath === undefined) return null;
+  try {
+    const input = config.tizenbrewLauncherTokenPath;
+    if (typeof input !== 'string' || !path.isAbsolute(input)) throw new Error();
+    const resolved = io.realpathSync(input);
+    const relative = path.relative(path.resolve(__dirname, '../..'), resolved);
+    if (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith('..' + path.sep)) throw new Error();
+    if (io.statSync(resolved).size > 128) throw new Error();
+    const descriptor = io.openSync(resolved, 'r');
+    const bytes = Buffer.alloc(129);
+    let count;
+    try { count = io.readSync(descriptor, bytes, 0, bytes.length, 0); }
+    finally { io.closeSync(descriptor); }
+    if (count > 128) throw new Error();
+    const token = bytes.subarray(0, count).toString('utf8').trim();
+    if (!/^[a-f0-9]{64}$/.test(token)) throw new Error();
+    return token;
+  } catch (_) { throw new Error('Invalid private launcher token configuration'); }
+}
+
+function getLauncherStatus(port, token, timeout = 3000) {
+  return new Promise((resolve, reject) => {
+    const request = http.get({ host: '127.0.0.1', port, path: '/status', agent: false,
+      headers: { Authorization: 'Bearer ' + token, Connection: 'close' } }, response => {
+      const chunks = [];
+      let bytes = 0;
+      response.on('data', chunk => {
+        bytes += chunk.length;
+        if (bytes > 65536) request.destroy(new Error('Launcher attestation response too large'));
+        else chunks.push(chunk);
+      });
+      response.on('error', () => reject(new Error('Launcher attestation response failed')));
+      response.on('aborted', () => reject(new Error('Launcher attestation response aborted')));
+      response.on('end', () => {
+        if (response.statusCode !== 200) return reject(new Error('Launcher attestation refused'));
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+        catch (_) { reject(new Error('Invalid launcher attestation response')); }
+      });
+    });
+    const timer = setTimeout(() => request.destroy(new Error('Launcher attestation timed out')), timeout);
+    request.once('error', () => reject(new Error('Launcher attestation request failed')));
+    request.once('close', () => clearTimeout(timer));
+  });
+}
+
+function launcherSession(status, debugPort) {
+  if (!status || status.enabled !== true || status.ready !== true || status.debuggerAttached !== true || status.phase !== 'idle' ||
+      status.lastDebugPort !== debugPort || !Number.isSafeInteger(status.debugLaunches) || status.debugLaunches < 1) throw new Error('Cannot attest the active TizenBrew debug session');
+  const session = { lastDebugPort: status.lastDebugPort, debugLaunches: status.debugLaunches };
+  for (const key of ['debuggerGeneration', 'generation', 'operationId', 'requestsStarted']) {
+    if (status[key] !== undefined) {
+      if (!Number.isSafeInteger(status[key]) || status[key] < 0) throw new Error('Invalid launcher session counter');
+      session[key] = status[key];
+    }
+  }
+  return session;
+}
+
+function sameLauncherSession(before, after) {
+  const keys = Object.keys(before);
+  if (keys.length !== Object.keys(after).length || keys.some(key => before[key] !== after[key])) throw new Error('TizenBrew debug session changed during capture');
+}
+
 function targetSocketUrl(target, port) {
   if (!target || target.type && target.type !== 'page' || typeof target.webSocketDebuggerUrl !== 'string') return null;
   try {
@@ -150,17 +214,26 @@ async function captureApp(options, dependencies = {}) {
   if (io.statSync(options.config).size > 100000) throw new Error('Client configuration too large');
   let config;
   try { config = JSON.parse(io.readFileSync(options.config, 'utf8')); } catch (_) { throw new Error('Invalid client configuration'); }
+  const launcherToken = readLauncherToken(config, io);
   const client = (dependencies.createClient || createClient)(config);
   const sdb = args => (dependencies.runSdb || runSdb)(options.sdb, args);
-  let tunnel, serial, localPort, cdp;
+  let tunnel, serial, localPort, cdp, launcherPort, initialSession;
+  let launcherForwarded = false;
   let connected = false, forwarded = false;
   try {
     tunnel = await client.tunnel(0);
     serial = '127.0.0.1:' + tunnel.port;
     connected = true; // A timed-out connect can still have established this transport.
     await sdb(['connect', serial]);
+    if (launcherToken) {
+      launcherPort = await (dependencies.freePort || freePort)();
+      if (!Number.isInteger(launcherPort) || launcherPort < 1024 || launcherPort > 65535) throw new Error('Invalid local launcher forward port');
+      launcherForwarded = true;
+      await sdb(['-s', serial, 'forward', 'tcp:' + launcherPort, 'tcp:8097']);
+      initialSession = launcherSession(await (dependencies.getLauncherStatus || getLauncherStatus)(launcherPort, launcherToken), options.port);
+    }
     localPort = await (dependencies.freePort || freePort)();
-    if (!Number.isInteger(localPort) || localPort < 1024 || localPort > 65535) throw new Error('Invalid local forward port');
+    if (!Number.isInteger(localPort) || localPort < 1024 || localPort > 65535 || localPort === launcherPort) throw new Error('Invalid local forward port');
     forwarded = true; // A timed-out command may still have created this exact forward.
     await sdb(['-s', serial, 'forward', 'tcp:' + localPort, 'tcp:' + options.port]);
     let targets;
@@ -168,11 +241,14 @@ async function captureApp(options, dependencies = {}) {
       try { targets = await (dependencies.getTargets || getTargets)(localPort); break; }
       catch (error) { if (attempt === 2) throw error; await new Promise(resolve => setTimeout(resolve, 100)); }
     }
-    for (const target of targets) {
+    const eligible = targets.filter(target => targetSocketUrl(target, localPort));
+    if (launcherToken && eligible.length !== 1) throw new Error('Launcher attestation requires exactly one app page target');
+    for (const target of eligible) {
       const url = targetSocketUrl(target, localPort);
       if (!url) continue;
       try {
         cdp = await (dependencies.openCdp || openCdp)(url);
+        if (launcherToken) break; // Ownership was attested by fixed app launcher and port.
         const result = await cdp.call('Runtime.evaluate', { expression: ATTEST, returnByValue: true });
         if (result && !result.exceptionDetails && result.result && result.result.type === 'string' && result.result.value === APP_ID) break;
       } catch (_) { /* Unattestable targets are never captured. */ }
@@ -180,12 +256,15 @@ async function captureApp(options, dependencies = {}) {
       cdp = null;
     }
     if (!cdp) throw new Error('Cannot attest the existing TizenBrew app debugger');
+    if (launcherToken) sameLauncherSession(initialSession, launcherSession(await (dependencies.getLauncherStatus || getLauncherStatus)(launcherPort, launcherToken), options.port));
     const png = decodePng(await cdp.call('Page.captureScreenshot', { format: 'png' }, 5000));
+    if (launcherToken) sameLauncherSession(initialSession, launcherSession(await (dependencies.getLauncherStatus || getLauncherStatus)(launcherPort, launcherToken), options.port));
     io.writeFileSync(options.out, png, { flag: 'wx', mode: 0o600 });
-    return { appId: APP_ID, bytes: png.length, output: options.out, scope: 'app-document' };
+    return { appId: APP_ID, bytes: png.length, output: options.out, scope: 'app-document', attestation: launcherToken ? 'pinned-tunnel-launcher-status' : 'page-app-id' };
   } finally {
     if (cdp) cdp.close();
     if (forwarded) { try { await sdb(['-s', serial, 'forward', '--remove', 'tcp:' + localPort]); } catch (_) { /* Disconnect below also retires our transport. */ } }
+    if (launcherForwarded) { try { await sdb(['-s', serial, 'forward', '--remove', 'tcp:' + launcherPort]); } catch (_) {} }
     if (connected) { try { await sdb(['disconnect', serial]); } catch (_) {} }
     if (tunnel) tunnel.close();
     client.close();
@@ -200,4 +279,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { captureApp, parseArgs, decodePng, targetSocketUrl, getTargets, openCdp, APP_ID };
+module.exports = { captureApp, parseArgs, decodePng, targetSocketUrl, getTargets, openCdp, readLauncherToken, getLauncherStatus, launcherSession, sameLauncherSession, APP_ID };

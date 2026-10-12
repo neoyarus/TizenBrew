@@ -83,7 +83,18 @@ function serviceHarness(options = {}) {
         setTimeout: timer.setTimeout, clearTimeout: timer.clearTimeout,
         tizen: {
             systeminfo: { getCapability: () => '5.0' },
-            application: { getAppInfo: () => ({ packageId: 'test' }) }
+            ApplicationControl: function (operation) { this.operation = operation; },
+            application: {
+                getAppInfo: () => ({ packageId: 'test' }),
+                launchAppControl(control, id, success, failure) {
+                    const pending = { control, id, resolve: success, reject: failure };
+                    resumeRequests.push(pending);
+                    if (options.throwResume) throw new Error('Native application API exception');
+                    if (options.deferResume) return;
+                    if (options.failResume || options.resumeOk === false) failure(new Error('Native resume failed'));
+                    else success();
+                }
+            }
         }
     });
     const mocks = {
@@ -110,11 +121,7 @@ function serviceHarness(options = {}) {
         'node-fetch': (url, requestOptions) => {
             fetchRequests.push({ url, options: requestOptions });
             if (requestOptions && requestOptions.method === 'POST') {
-                const pending = { url, options: requestOptions };
-                resumeRequests.push(pending);
-                if (options.deferResume) return new Promise((resolve, reject) => { pending.resolve = resolve; pending.reject = reject; });
-                if (options.failResume) return Promise.reject(new Error('Resume failed'));
-                return Promise.resolve({ ok: options.resumeOk !== false });
+                throw new Error('Foregrounding must use the native API, not a loopback HTTP POST');
             }
             return Promise.resolve({
                 json: () => Promise.resolve({ device: { developerIP: '127.0.0.1', developerMode: '1' } }),

@@ -254,7 +254,9 @@ test('an attached paused page resumes after frontend websocket closure without e
     assert.equal(h.adbClients.length, 1);
     assert.equal(h.cdpClients[0], debuggerClient);
     assert.equal(h.resumeRequests.length, 1);
-    assert.equal(h.resumeRequests[0].url, 'http://127.0.0.1:8001/api/v2/applications/test.TizenBrewStandalone');
+    assert.equal(h.resumeRequests[0].id, 'test.TizenBrewStandalone');
+    assert.equal(h.resumeRequests[0].control.operation, 'http://samsung.com/appcontrol/operation/eden_resume');
+    assert.equal(h.fetchRequests.some(request => request.options && request.options.method === 'POST'), false);
     const status = h.requestRemote();
     assert.equal(status.body.debugLaunches, 1);
     assert.equal(status.body.resumeRequests, 1);
@@ -277,6 +279,52 @@ test('an ambiguous foreground request failure does not trigger a second debug la
     assert.equal(h.resumeRequests.length, 1);
     assert.equal(h.adbClients.length, 1);
     assert.equal(h.cdpClients.length, 1);
+});
+
+test('native foregrounding is bounded and a late callback cannot rewrite its timeout or restart the debugger', async () => {
+    const h = await attachedRemoteHarness({ deferResume: true });
+    const client = h.cdpClients[0];
+    const result = h.requestRemote({ method: 'POST', path: '/launch' });
+    await settle();
+    assert.equal(h.resumeRequests.length, 1);
+    h.timer.advance(2999);
+    assert.equal(result.status, undefined);
+    h.timer.advance(1);
+    await result.done;
+    assert.equal(result.status, 503);
+    h.resumeRequests[0].resolve();
+    await settle();
+    assert.equal(result.status, 503);
+    assert.equal(h.adbClients.length, 1);
+    assert.equal(h.cdpClients[0], client);
+    assert.equal(client.closed, undefined);
+    assert.equal(h.requestRemote().body.requestsFailed, 1);
+});
+
+test('synchronous native foreground errors fail without HTTP or debugger restart and release the request slot', async () => {
+    const h = await attachedRemoteHarness({ throwResume: true });
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const result = h.requestRemote({ method: 'POST', path: '/launch' });
+        await result.done;
+        assert.equal(result.status, 503);
+    }
+    assert.equal(h.resumeRequests.length, 2);
+    assert.equal(h.adbClients.length, 1);
+    assert.equal(h.cdpClients.length, 1);
+    assert.equal(h.fetchRequests.some(request => request.options && request.options.method === 'POST'), false);
+});
+
+test('a native resume callback from a disconnected debugger cannot confirm the old session', async () => {
+    const h = await attachedRemoteHarness({ deferResume: true });
+    const result = h.requestRemote({ method: 'POST', path: '/launch' });
+    await settle();
+    h.cdpClients[0].emit('disconnect');
+    h.resumeRequests[0].resolve();
+    await result.done;
+    assert.equal(result.status, 503);
+    assert.equal(h.adbClients.length, 1);
+    assert.equal(h.cdpClients.length, 1);
+    assert.equal(h.requestRemote().body.requestsFailed, 1);
 });
 
 test('an explicitly failed live-session probe starts one fresh debugger', async () => {
