@@ -63,7 +63,10 @@ function fixture(platform = {}) {
   server.listen = (port, host) => { assert.equal(port, 8098); assert.equal(host, '0.0.0.0'); };
   server.close = () => { server.closed = true; };
   server.setTimeout = () => {};
-  const shell = new EventEmitter(), adbStream = fakeSocket();
+  const shell = platform.shell || new EventEmitter(), adbStream = fakeSocket();
+  const adbClient = new EventEmitter();
+  adbClient._stream = adbStream;
+  adbClient.createStream = command => { commands.push(command); return shell; };
   const handle = start({ publicKey: keys.publicKey, tlsKey: 'private test stub', tlsCert: 'public test stub', port: 8098, ...platform.options }, {
     https: { createServer(options, fn) { assert.equal(options.secureProtocol, 'TLSv1_2_method'); assert.equal(options.handshakeTimeout, 10000); handler = fn; return server; } },
     fs: { existsSync: () => true, writeFileSync(path, data, options) { assert.equal(files.has(path), false); files.set(path, data); writes.push({ path, options }); }, unlinkSync: path => files.delete(path), ...platform.fs },
@@ -71,7 +74,7 @@ function fixture(platform = {}) {
     process: platform.process,
     WebSocket: platform.WebSocket,
     net: { connect(target) { targets.push(target); const socket = fakeSocket(); targets[targets.length - 1].socket = socket; return socket; } },
-    adbhost: { createConnection(target) { assert.deepEqual(target, { host: '127.0.0.1', port: 26101 }); return { _stream: adbStream, createStream(command) { commands.push(command); return shell; } }; } },
+    adbhost: { createConnection(target) { assert.deepEqual(target, { host: '127.0.0.1', port: 26101 }); return adbClient; } },
     now: () => now,
     setTimeout(callback, delay) { const id = ++timerId; timers.set(id, { callback, at: now + delay }); return id; },
     clearTimeout(id) { timers.delete(id); }
@@ -95,7 +98,7 @@ function fixture(platform = {}) {
     return { 'x-recovery-nonce': nonce, 'x-recovery-sha256': hash, 'x-recovery-bytes': String(body.length),
       'x-recovery-signature': signature(canonical(nonce, method, route, hash, body.length)) };
   }
-  return { handle, server, files, writes, shell, commands, targets, timers, request, challenge, authHeaders,
+  return { handle, server, files, writes, shell, adbStream, adbClient, commands, targets, timers, request, challenge, authHeaders,
     advance(ms) { now += ms; for (const [id, timer] of [...timers]) if (timer.at <= now) { timers.delete(id); timer.callback(); } },
     install(body = zip(), headers = {}) { return request('POST', '/install', body, { 'content-type': 'application/octet-stream', 'x-widget-signature': signature(body), ...headers }); },
     connect(headers, route = '/sdb', head = Buffer.alloc(0)) {
@@ -335,10 +338,73 @@ test('signed target upload stages mode0600 and runs only the fixed localhost ins
   assert.equal(upload.res.status, 202);
   assert.equal(h.writes[0].options.mode, 384);
   assert.equal(h.writes[0].options.flag, 'wx');
-  assert.match(h.commands[0], /^shell:0 vd_appinstall xvvl3S1bvH \/home\/owner\/share\/tmp\/sdk_tools\/TizenBrew-recovery-[a-f0-9]{64}-[a-f0-9]{16}\.wgt$/);
+  assert.match(h.commands[0], /^shell:0 vd_appinstall xvvl3S1bvH \/home\/owner\/share\/tmp\/sdk_tools\/TB-recovery-[a-f0-9]{16}\.wgt$/);
+  assert.ok(h.writes[0].path.length < 128);
   h.shell.emit('data', Buffer.from('install completed'));
   assert.equal(h.handle.state.result, 'completed');
   assert.equal(h.files.size, 0);
+});
+
+test('actual adbhost writable finish does not prematurely end installation or discard later readable output', async () => {
+  const AdbStream = require('adbhost/lib/stream.js');
+  const shell = new AdbStream({ _nextStreamId: 12345, _writePacket() {} });
+  const h = fixture({ shell });
+  await h.install().res.done;
+  const writableFinished = once(shell, 'finish');
+  shell.end(); // The exact operation adbhost performs when it receives CLSE.
+  await writableFinished;
+  assert.equal(shell.readableEnded, false);
+  assert.equal(h.handle.state.phase, 'installing');
+  assert.equal(h.handle.state.result, null);
+  assert.equal(h.adbStream.destroyed, undefined);
+  assert.equal(h.files.size, 1);
+  assert.equal(h.install().res.status, 409);
+  const received = once(shell, 'data');
+  shell.push(Buffer.from('install completed\x00'));
+  await received;
+  assert.equal(h.handle.state.result, 'completed');
+  assert.equal(h.files.size, 0);
+  assert.equal(h.adbStream.destroyed, true);
+});
+
+test('actual adbhost split WRTE output and CLSE in the same tick preserve the installer terminal result', async () => {
+  const AdbStream = require('adbhost/lib/stream.js'), AdbHostClient = require('adbhost/lib/client.js');
+  const commands = require('adbhost/lib/packet.js').commands;
+  for (const [text, expected] of [['install completed', 'completed'], ['installation failed', 'failed']]) {
+    const shell = new AdbStream({ _nextStreamId: 12345, _writePacket() {} }), h = fixture({ shell });
+    await h.install().res.done;
+    const client = { _userStreams: { [shell.localId()]: shell }, _writePacket() {} };
+    const writableFinished = once(shell, 'finish');
+    for (const chunk of [text.slice(0, 8), text.slice(8) + '\x00']) {
+      client._packet = { command: commands.WRTE, arg2: shell.localId(), data: Buffer.from(chunk) };
+      AdbHostClient.prototype._onPacket.call(client);
+    }
+    client._packet = { command: commands.CLSE, arg2: shell.localId() };
+    AdbHostClient.prototype._onPacket.call(client);
+    await writableFinished;
+    assert.equal(h.handle.state.result, expected);
+    assert.equal(h.handle.state.log, text + '\x00');
+    assert.equal(h.files.size, 0);
+  }
+});
+
+test('empty writable completion settles only after a bounded drain tick and closure retains staging', async () => {
+  for (const event of ['deadline', 'end', 'close', 'error']) {
+    const h = fixture();
+    await h.install().res.done;
+    h.shell.emit('finish');
+    assert.equal(h.handle.state.phase, 'installing');
+    assert.equal(h.adbStream.destroyed, undefined);
+    if (event === 'deadline') {
+      h.advance(0);
+      assert.equal(h.handle.state.installDiagnostics.terminalReason, 'unacknowledged-stream-finish');
+    } else h.shell.emit(event, event === 'error' ? new Error('Transport failure') : undefined);
+    assert.equal(h.handle.state.result, 'inconclusive');
+    assert.equal(h.adbStream.destroyed, true);
+    assert.equal(h.files.size, 1);
+    assert.equal(h.install().res.status, 409);
+    assert.equal(h.commands.length, 1);
+  }
 });
 
 test('widget checksum, deployment signature, and companion target rejection happen before staging or SDB', async () => {
@@ -368,6 +434,102 @@ test('inconclusive installer keeps its staged bytes and blocks another update', 
   assert.equal(h.files.size, 1);
   assert.equal(h.install().res.status, 409);
   assert.equal(h.commands.length, 1);
+});
+
+test('inconclusive installs retain an authenticated repair tunnel while upload and active installs exclude it', async () => {
+  for (const phase of ['upload', 'installing', 'inconclusive']) {
+    const h = fixture();
+    if (phase === 'upload') h.request('POST', '/install', zip(), { 'content-type': 'application/octet-stream', 'x-widget-signature': signature(zip()) }, true, false);
+    else { await h.install().res.done; if (phase === 'inconclusive') h.advance(120000); }
+    const tunnel = h.connect();
+    if (phase === 'inconclusive') {
+      assert.equal(h.targets.length, 1);
+      assert.equal(h.targets[0].host, '127.0.0.1'); assert.equal(h.targets[0].port, 26101);
+      h.targets[0].socket.emit('connect');
+      assert.match(tunnel.data.join(''), /200 Connection Established/);
+      assert.match(h.connect({}).data.join(''), /401/);
+      assert.equal(h.install().res.status, 409);
+      h.advance(constants.TUNNEL_TTL);
+      assert.equal(tunnel.destroyed, true);
+      const replacement = h.connect(); h.targets[1].socket.emit('connect');
+      assert.match(replacement.data.join(''), /200 Connection Established/, 'repair remains accessible after the first tunnel expires');
+      assert.equal(h.files.size, 1);
+    } else {
+      assert.match(tunnel.data.join(''), /409/);
+      assert.equal(h.targets.length, 0);
+    }
+  }
+});
+
+test('authenticated installer diagnostics record CNXN, OPEN and static terminal reasons without raw errors or paths', async () => {
+  const h = fixture();
+  assert.equal(h.request('GET', '/status').res.body.installDiagnostics, null);
+  await h.install().res.done;
+  assert.deepEqual(h.request('GET', '/status').res.body.installDiagnostics, {
+    cnxnSeen: false, openAccepted: false, writableFinished: false, terminalReason: null, transportCode: null
+  });
+  h.adbClient.emit('connect');
+  h.shell.remoteId = () => -1;
+  h.adbClient.emit('_CNXN');
+  assert.equal(h.handle.state.installDiagnostics.openAccepted, false);
+  h.shell.remoteId = () => 23456;
+  h.adbClient.emit('_CNXN'); h.shell.emit('finish');
+  const cause = Object.assign(new Error('secret /home/owner/private.wgt wss://private.invalid'), { code: 'ECONNRESET' });
+  h.adbStream.emit('error', cause);
+  const diagnostics = h.request('GET', '/status').res.body.installDiagnostics;
+  assert.deepEqual(diagnostics, { cnxnSeen: true, openAccepted: true, writableFinished: true, terminalReason: 'transport-error', transportCode: 'ECONNRESET' });
+  assert.equal(JSON.stringify(diagnostics).includes('secret'), false);
+  assert.equal(JSON.stringify(diagnostics).includes('/home'), false);
+  assert.equal(h.request('GET', '/status', Buffer.alloc(0), {}, false).res.status, 401);
+  assert.equal(h.request('GET', '/capabilities').res.body.implementationVersion, '1.1.0');
+});
+
+test('actual adbhost CNXN and accepted or rejected OPEN produce bounded diagnostic outcomes', async () => {
+  const AdbStream = require('adbhost/lib/stream.js'), AdbHostClient = require('adbhost/lib/client.js');
+  const commands = require('adbhost/lib/packet.js').commands;
+  for (const accepted of [false, true]) {
+    const shell = new AdbStream({ _nextStreamId: 12345, _writePacket() {} }), h = fixture({ shell });
+    await h.install().res.done;
+    h.adbClient._userStreams = { [shell.localId()]: shell };
+    h.adbClient._writePacket = () => {};
+    h.adbClient._packet = { command: commands.CNXN, arg1: 1, arg2: 4096, data: Buffer.from('device::') };
+    AdbHostClient.prototype._onPacket.call(h.adbClient);
+    if (accepted) {
+      h.adbClient._packet = { command: commands.OKAY, arg1: 42, arg2: shell.localId() };
+      AdbHostClient.prototype._onPacket.call(h.adbClient);
+    }
+    const finished = once(shell, 'finish');
+    h.adbClient._packet = { command: commands.CLSE, arg1: accepted ? 42 : 0, arg2: shell.localId() };
+    AdbHostClient.prototype._onPacket.call(h.adbClient);
+    await finished;
+    assert.equal(h.handle.state.result, null, 'classification must wait for readable drain');
+    h.advance(0);
+    assert.deepEqual(h.handle.state.installDiagnostics, { cnxnSeen: true, openAccepted: accepted,
+      writableFinished: true, terminalReason: accepted ? 'stream-finish' : 'unacknowledged-stream-finish', transportCode: null });
+    assert.equal(h.handle.state.result, 'inconclusive');
+    assert.equal(h.files.size, 1);
+    assert.equal(h.install().res.status, 409);
+  }
+});
+
+test('terminal installer diagnostic reasons preserve confirmed results and reject unknown raw error codes', async () => {
+  for (const [event, payload, result, reason, code] of [
+    ['data', Buffer.from('install completed'), 'completed', 'reported-success', null],
+    ['data', Buffer.from('installation failed'), 'failed', 'reported-failure', null],
+    ['error', Object.assign(new Error('private error'), { code: 'private-code' }), 'inconclusive', 'stream-error', 'UNKNOWN'],
+    ['end', null, 'inconclusive', 'readable-end', null],
+    ['close', null, 'inconclusive', 'stream-close', null],
+    ['deadline', null, 'inconclusive', 'deadline', null]
+  ]) {
+    const h = fixture(); await h.install().res.done;
+    if (event === 'deadline') h.advance(120000); else h.shell.emit(event, payload);
+    assert.equal(h.handle.state.result, result);
+    assert.equal(h.handle.state.installDiagnostics.terminalReason, reason);
+    assert.equal(h.handle.state.installDiagnostics.transportCode, code);
+    h.shell.emit('error', new Error('late error')); h.adbClient.emit('connect');
+    assert.equal(h.handle.state.installDiagnostics.terminalReason, reason);
+    assert.equal(h.handle.state.installDiagnostics.cnxnSeen, false);
+  }
 });
 
 test('an aborted upload releases its slot without staging partial bytes', async () => {

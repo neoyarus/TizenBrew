@@ -166,7 +166,7 @@ function start(options, dependencies) {
   var remoteRequestBusy = false;
   var remotePowerBusy = false;
   var remote = tvRemote.create(options, { WebSocket: deps.WebSocket, os: deps.os, setTimeout: later, clearTimeout: cancel });
-  var state = { phase: 'ready', operation: 0, result: null, log: '', tunnels: 0 };
+  var state = { phase: 'ready', operation: 0, result: null, log: '', tunnels: 0, installDiagnostics: null };
 
   function send(response, status, value) {
     if (response.finished || response.writableEnded || response.destroyed) return;
@@ -214,6 +214,7 @@ function start(options, dependencies) {
     }
     return {
       protocol: 'TBRC1',
+      implementationVersion: '1.1.0',
       runtime: { node: process.version, platform: process.platform, architecture: process.arch, uid: identity('getuid'), gid: identity('getgid'), localIPv4: tvRemote.localAddresses(deps.os) },
       bootIdHash: bootIdHash,
       uptimeSeconds: uptimeSeconds,
@@ -238,16 +239,23 @@ function start(options, dependencies) {
     disk.mkdirSync(path, 448);
   }
   function install(body, hash) {
-    var stagePath = STAGE + '/TizenBrew-recovery-' + hash + '-' + random(8).toString('hex') + '.wgt';
+    var stagePath = STAGE + '/TB-recovery-' + random(8).toString('hex') + '.wgt';
     var settled = false;
+    var shellFinishTimer;
     state.operation++;
     state.phase = 'installing';
     state.result = null;
     state.log = '';
-    function finish(result) {
+    var diagnostics = state.installDiagnostics = { cnxnSeen: false, openAccepted: false,
+      writableFinished: false, terminalReason: null, transportCode: null };
+    function finish(result, reason, cause) {
       if (settled) return;
       settled = true;
       cancel(installTimer);
+      cancel(shellFinishTimer);
+      diagnostics.terminalReason = reason;
+      if (cause) diagnostics.transportCode = ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH',
+        'ENETUNREACH', 'EADDRNOTAVAIL', 'EPIPE'].indexOf(cause.code) !== -1 ? cause.code : 'UNKNOWN';
       state.result = result;
       state.phase = result;
       if (installClient && installClient._stream) installClient._stream.destroy();
@@ -260,21 +268,35 @@ function start(options, dependencies) {
       disk.writeFileSync(stagePath, body, { flag: 'wx', mode: 384 });
       var adb = deps.adbhost || require('adbhost');
       installClient = adb.createConnection({ host: '127.0.0.1', port: 26101 });
-      installTimer = later(function () { finish('inconclusive'); }, 120000);
-      installClient._stream.on('error', function () { finish('inconclusive'); });
-      installClient._stream.on('close', function () { finish('inconclusive'); });
+      installTimer = later(function () { finish('inconclusive', 'deadline'); }, 120000);
+      installClient.on('connect', function () { if (!settled) diagnostics.cnxnSeen = true; });
+      installClient._stream.on('error', function (cause) { finish('inconclusive', 'transport-error', cause); });
+      installClient._stream.on('close', function () { finish('inconclusive', 'transport-close'); });
       var shell = installClient.createStream('shell:0 vd_appinstall ' + TARGET + ' ' + stagePath);
+      // adbhost emits this only when OKAY accepts its single OPEN stream.
+      installClient.on('_CNXN', function () {
+        if (!settled && typeof shell.remoteId === 'function' && shell.remoteId() >= 0) diagnostics.openAccepted = true;
+      });
       shell.on('data', function (chunk) {
         if (settled) return;
         state.log = (state.log + chunk.toString()).slice(-65536);
-        if (/install failed|installation failed/i.test(state.log)) finish('failed');
-        else if (/install completed|successfully installed/i.test(state.log)) finish('completed');
+        if (/install failed|installation failed/i.test(state.log)) finish('failed', 'reported-failure');
+        else if (/install completed|successfully installed/i.test(state.log)) finish('completed', 'reported-success');
       });
-      shell.on('error', function () { finish('inconclusive'); });
-      shell.on('finish', function () { finish('inconclusive'); });
-      shell.on('end', function () { finish('inconclusive'); });
-      shell.on('close', function () { finish('inconclusive'); });
-    } catch (error) { finish('failed'); }
+      shell.on('error', function (cause) { finish('inconclusive', 'stream-error', cause); });
+      // adbhost calls Duplex.end() for CLSE, finishing only the writable side.
+      // Drain already queued readable output before classifying an empty CLSE.
+      // Missing OPEN acknowledgment is diagnostic evidence, not install success.
+      shell.on('finish', function () {
+        if (settled || shellFinishTimer !== undefined) return;
+        diagnostics.writableFinished = true;
+        shellFinishTimer = later(function () {
+          finish('inconclusive', diagnostics.openAccepted ? 'stream-finish' : 'unacknowledged-stream-finish');
+        }, 0);
+      });
+      shell.on('end', function () { finish('inconclusive', 'readable-end'); });
+      shell.on('close', function () { finish('inconclusive', 'stream-close'); });
+    } catch (error) { finish('failed', 'setup-error', error); }
   }
 
   var server = (deps.https || https).createServer({ key: options.tlsKey, cert: options.tlsCert, secureProtocol: 'TLSv1_2_method', handshakeTimeout: 10000 }, function (request, response) {
@@ -295,7 +317,8 @@ function start(options, dependencies) {
     if (!auth) return send(response, 401, { error: 'Authentication required' });
     if (request.method === 'GET' && request.url === '/status') {
       if (!empty(request, auth)) return send(response, 400, { error: 'Empty body required' });
-      return send(response, 200, { phase: state.phase, operation: state.operation, result: state.result, log: state.log, tunnels: tunnels.length, target: TARGET });
+      return send(response, 200, { phase: state.phase, operation: state.operation, result: state.result, log: state.log, tunnels: tunnels.length, target: TARGET,
+        installDiagnostics: state.installDiagnostics });
     }
     if (request.method === 'GET' && request.url === '/capabilities') {
       if (!empty(request, auth)) return send(response, 400, { error: 'Empty body required' });
@@ -384,7 +407,9 @@ function start(options, dependencies) {
     function refuse(status) { socket.end('HTTP/1.1 ' + status + '\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); }
     if (!auth) return refuse('401 Unauthorized');
     if (request.url !== '/sdb' || !empty(request, auth) || head && head.length) return refuse('400 Bad Request');
-    if (closed || uploadBusy || tunnels.length >= 2) return refuse('409 Conflict');
+    // A full-SDB operator must retain a repair path after an uncertain install.
+    // Uploads/active installs still exclude new tunnels; install and power stay locked.
+    if (closed || uploadBusy && state.phase !== 'inconclusive' || tunnels.length >= 2) return refuse('409 Conflict');
     var destination;
     var tunnel = { client: socket, destination: null, timer: null, closed: false };
     tunnels.push(tunnel);
